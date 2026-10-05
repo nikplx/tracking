@@ -388,12 +388,3 @@ def normalize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
             flat["checkpoints"] = doc["checkpoints"]
     return flat
 
-
-def load_runs_df(collection, query: Optional[dict] = None):
-    """Fetch a Mongo collection and return a normalized ``pandas.DataFrame``."""
-    import pandas as pd
-
-    docs = list(collection.find(query or {}))
-    if not docs:
-        return pd.DataFrame()
-    return pd.DataFrame([normalize_doc(d) for d in docs])

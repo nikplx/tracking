@@ -136,14 +136,14 @@ runnable.kernel()
 
 `Resolver` asks for `"run"` → needs `matrix`, `tolerance`, `preconditioner` → `tolerance` is already in `spec`, `matrix` and `preconditioner` are built from their own factories (each resolving *their* dependencies the same way), and the whole graph is built in the right order regardless of which key you ask for first. Every value a literal in `spec` always wins over a factory with the same name, and each key is only built once per `Resolver` (so `matrix` is built once even though both `IterativeSolver` and `build_jacobi` depend on it).
 
-### Describing a sweep: `BM` and the grid
+### Describing a sweep: `Sweep` and the grid
 
-A `BM` ("benchmark") is one named family of runs: a list of fixed `cases` (e.g. one per input dataset) crossed with a `grid` of parameters that gets fully expanded — add a value to any list and every existing combination now also runs with it:
+A `Sweep` ("benchmark") is one named family of runs: a list of fixed `cases` (e.g. one per input dataset) crossed with a `grid` of parameters that gets fully expanded — add a value to any list and every existing combination now also runs with it:
 
 ```python
-from tracking import BM, run_benchmark
+from tracking import Sweep, run_sweep
 
-bm = BM(
+bm = Sweep(
     cases=[
         {"matrix_path": "well_conditioned_512.npz"},
         {"matrix_path": "ill_conditioned_512.npz"},
@@ -158,14 +158,14 @@ bm = BM(
     collection="solver_sweep_v1",
 )
 
-run_benchmark("solver_sweep", bm)
+run_sweep("solver_sweep", bm)
 ```
 
-This runs `2 cases × 3 tolerances × 2 preconditioners = 12` points, one `Experiment` each. A run that already completed with the exact same spec (checked against MongoDB) is skipped, so re-running the same sweep after adding one more `tolerance` value only runs the new points. A point that raises (a solver that fails to converge, a bad input file) is recorded as a `FAILED` run and the sweep keeps going — call `execute(...)` directly instead of `run_benchmark` if you want a failure to stop you immediately, e.g. while developing a new `Runnable`.
+This runs `2 cases × 3 tolerances × 2 preconditioners = 12` points, one `Experiment` each. A run that already completed with the exact same spec (checked against MongoDB) is skipped, so re-running the same sweep after adding one more `tolerance` value only runs the new points. A point that raises (a solver that fails to converge, a bad input file) is recorded as a `FAILED` run and the sweep keeps going — call `execute(...)` directly instead of `run_sweep` if you want a failure to stop you immediately, e.g. while developing a new `Runnable`.
 
 ### Running a sweep from the command line
 
-`run(benchmarks)` turns a `dict[str, BM]` into a small CLI, including `--array-id` for SLURM job arrays (one array index per named `BM`, not per grid point — each `BM`'s own grid still runs sequentially within that task):
+`run(benchmarks)` turns a `dict[str, BM]` into a small CLI, including `--array-id` for SLURM job arrays (one array index per named `Sweep`, not per grid point — each `Sweep`'s own grid still runs sequentially within that task):
 
 ```python
 # sweep.py

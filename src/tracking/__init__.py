@@ -1,21 +1,25 @@
 from tracking import observe
+from tracking.compare import add_reference_diffs
 from tracking.configurable import Configurable
-from tracking.experiment import Experiment, load_runs_df, normalize_doc
-from tracking.driver import BM, execute, run, run_benchmark
+from tracking.experiment import Experiment, normalize_doc
+from tracking.driver import Sweep, execute, run, run_sweep
 from tracking.resolve import Resolver, ResolutionError
 from tracking.runnable import Runnable
+from tracking.load import load_json_data, load_mongo_data
 
 __all__ = [
-    "BM",
+    "Sweep",
     "Configurable",
     "Experiment",
     "ResolutionError",
     "Resolver",
     "Runnable",
+    "add_reference_diffs",
     "execute",
-    "load_runs_df",
+    "load_json_data",
+    "load_mongo_data",
     "normalize_doc",
     "observe",
     "run",
-    "run_benchmark",
+    "run_sweep",
 ]

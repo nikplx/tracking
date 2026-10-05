@@ -32,7 +32,7 @@ Backend = Literal["mongodb", "file"]
 
 
 @dataclass
-class BM:
+class Sweep:
     """One benchmark entry: what varies, and how to wire it up.
 
     No ``type`` field. Adding a new kind of run (a new system, a new
@@ -86,7 +86,9 @@ def execute(
         logger.warning("run already exists for %s, skipping: %s", name, spec)
         return
 
-    with Experiment(name=name, params=spec, backend=backend,
+    factory_spec = {**spec, **{f"{k}_factory": v.__name__ for k, v in factories.items()}}
+
+    with Experiment(name=name, params=factory_spec, backend=backend,
                     checkpoints=checkpoint, collection=collection) as run:
         runnable = Resolver(spec, factories).build(entry)
 
@@ -98,7 +100,7 @@ def execute(
             run.add_profile(profiler)
 
 
-def run_benchmark(name: str, bm: BM) -> None:
+def run_sweep(name: str, sweep: Sweep) -> None:
     """Run every point in ``bm``'s grid, one :class:`Experiment` each.
 
     A single point raising (a non-converging solver, a bad input file, ...)
@@ -108,14 +110,14 @@ def run_benchmark(name: str, bm: BM) -> None:
     point's exception to propagate (e.g. while developing a new
     ``Runnable``).
     """
-    for case in bm.cases:
-        for params in expand_grid(bm.grid):
+    for case in sweep.cases:
+        for params in expand_grid(sweep.grid):
             spec = {**case, **params}
             try:
                 execute(
-                    name, spec, bm.entry, bm.factories,
-                    backend=bm.backend, collection=bm.collection,
-                    checkpoint=bm.checkpoint, profile=bm.profile, overwrite=bm.overwrite,
+                    name, spec, sweep.entry, sweep.factories,
+                    backend=sweep.backend, collection=sweep.collection,
+                    checkpoint=sweep.checkpoint, profile=sweep.profile, overwrite=sweep.overwrite,
                 )
             except Exception:
                 logger.exception("run failed for %s, spec=%s; continuing sweep", name, spec)
@@ -131,7 +133,7 @@ def setup_logger() -> logging.Logger:
     return logging.getLogger()
 
 
-def run(benchmarks: dict[str, BM]) -> None:
+def run(benchmarks: dict[str, Sweep]) -> None:
     parser = argparse.ArgumentParser(prog='chembench')
     parser.add_argument('-b', '--bench', type=str, help="Specific benchmark to run")
     parser.add_argument('-a', '--array-id', type=int, help="Run benchmark by index mapping (for Slurm arrays)")
@@ -156,13 +158,13 @@ def run(benchmarks: dict[str, BM]) -> None:
             sys.exit(1)
         target = bench_names[args.array_id]
         logger.info("Mapped SLURM_ARRAY_TASK_ID %d -> %s", args.array_id, target)
-        run_benchmark(target, benchmarks[target])
+        run_sweep(target, benchmarks[target])
     elif args.bench:
         if args.bench not in benchmarks:
             logger.error("Benchmark '%s' not found.", args.bench)
             sys.exit(1)
-        run_benchmark(args.bench, benchmarks[args.bench])
+        run_sweep(args.bench, benchmarks[args.bench])
     else:
         for name, bm in benchmarks.items():
-            run_benchmark(name, bm)
+            run_sweep(name, bm)
 
