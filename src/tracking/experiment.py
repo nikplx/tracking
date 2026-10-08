@@ -22,7 +22,13 @@ from tracking._vendor.sacred.observers.mongo import QueuedMongoObserver
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from tracking import observe
-from tracking.configurable import Configurable
+from tracking.hashing import (
+    _cleaned,
+    _ensure_hash_index,
+    _successful_file_hashes,
+    spec_hash,
+    to_bsonable,
+)
 
 logger = logging.getLogger()
 
@@ -39,84 +45,6 @@ ex = sacred.Experiment(SACRED_EXPERIMENT, save_git_info=False)
 def _main():
     """Dummy command: runs are driven manually via :class:`BenchmarkRun`."""
     return None
-
-
-# ---------------------------------------------------------------------------
-# BSON-safe cleaning (replaces the old ``clean_value``)
-# ---------------------------------------------------------------------------
-
-_TRUNCATE_AT = 4000
-
-
-def dims_of(v: Any) -> dict[str, Any] | None:
-    """Return ``v.dims()`` if it defines that protocol, else ``None``.
-
-    The ``dims()`` protocol lets a parameter object control how it is
-    tracked: instead of falling through to ``str(v)`` (a verbose blob for
-    dataclasses carrying large payloads like geometries), the returned
-    dict of plain scalar values is stored. Only a ``dict`` return value
-    is honored; anything else falls through to the normal handling.
-    """
-    dims = getattr(v, "dims", None)
-    if callable(dims):
-        d = dims()
-        if isinstance(d, dict):
-            return d
-    return None
-
-
-def to_bsonable(v: Any) -> Any:
-    """Convert arbitrary benchmark params/metrics into BSON-encodable values."""
-    if v is None or isinstance(v, (bool, int, float, str)):
-        return v
-    if isinstance(v, np.number):
-        return v.item()
-    if isinstance(v, np.ndarray):
-        return [to_bsonable(x) for x in v.tolist()]
-    if isinstance(v, (list, tuple)):
-        return [to_bsonable(x) for x in v]
-    if isinstance(v, dict):
-        return {str(k): to_bsonable(x) for k, x in v.items()}
-    if isinstance(v, (Path,)):
-        return str(v)
-    d = dims_of(v)
-    if d is not None:
-        return {str(k): to_bsonable(x) for k, x in d.items()}
-    if isinstance(v, Configurable):
-        return v.__class__.__name__
-    if hasattr(v, "name") and isinstance(v.name, str):
-        return v.name
-    s = str(v)
-    if len(s) > _TRUNCATE_AT:
-        s = s[:_TRUNCATE_AT] + "...<truncated>"
-    return s
-
-
-def _cleaned(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Clean params for storage, expanding top-level ``dims()`` objects.
-
-    A top-level value defining ``dims()`` (see :func:`dims_of`) is replaced
-    by its dims entries, so dimensions stay flat scalar columns (e.g.
-    ``dataset``/``reaction``/``reaction_file``) instead of one verbose
-    stringified blob. The raw object is still available to the
-    :class:`~tracking.resolve.Resolver` -- this only affects what is
-    tracked. Explicit keys in ``params`` win on collision, processed in
-    order.
-    """
-    out: Dict[str, Any] = {}
-    for k, v in params.items():
-        if isinstance(v, (dict, list, tuple)):
-            continue
-        d = dims_of(v)
-        if d is not None:
-            for dk, dv in d.items():
-                out[str(dk)] = to_bsonable(dv)
-    # Explicit scalar keys win over expanded dims on collision: re-apply
-    # any plain (non-dims) entries last.
-    for k, v in params.items():
-        if isinstance(v, (dict, list, tuple)) or dims_of(v) is None:
-            out[str(k)] = to_bsonable(v)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +77,10 @@ def get_mongo_client() -> pymongo.MongoClient:
 
 def get_runs_collection(collection: str):
     return get_mongo_client()[MONGO_DB][collection or "runs"]
+
+
+def _jsonl_path(file_path=None) -> Path:
+    return Path(file_path) if file_path is not None else DATA_DIR / "experiments.jsonl"
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +212,9 @@ class Experiment:
         logger.info("running experiment with config:\n" + yaml.dump(config))
 
         config["benchmark_name"] = self.name
+        # Dedup key: lets Experiment.exists find this run with a single
+        # indexed lookup instead of one equality clause per dimension.
+        config["spec_hash"] = spec_hash(self.params)
         observers = self._make_observers()
         previous, ex.observers = ex.observers, observers
         try:
@@ -369,22 +304,32 @@ class Experiment:
         backend: Backend = "mongodb",
         collection: Optional[str] = None,
     ) -> bool:
-        if backend != "mongodb":
+        """Skip check: is there a completed run with these dimensions?
+
+        Compares a single :func:`spec_hash` over the cleaned dimensions
+        instead of one equality clause per key. Runs written before the
+        hash existed have no ``spec_hash`` and never match (they re-run
+        once, then carry the hash going forward).
+        """
+        h = spec_hash(params)
+        if backend == "mongodb":
+            coll = get_runs_collection(collection or "runs")
+            _ensure_hash_index(coll, f"{MONGO_DB}.{collection or 'runs'}")
+            return coll.find_one(
+                {"config.spec_hash": h, "status": "COMPLETED"},
+                {"_id": 1},
+            ) is not None
+        elif backend == "file":
+            return h in _successful_file_hashes(_jsonl_path())
+        else:
             return False
-        coll = get_runs_collection(collection or "runs")
-        cleaned = _cleaned(params)
-        query = {
-            f"config.{k}": v
-            for k, v in cleaned.items()
-            if k != "benchmark_name"
-        }
-        query["status"] = "COMPLETED"
-        return coll.find_one(query, {"_id": 1}) is not None
 
     # -- legacy file backend ---------------------------------------------
-    def _save_to_jsonl(self, file_path: str = DATA_DIR/"experiments.jsonl") -> None:
+    def _save_to_jsonl(self, file_path=None) -> None:
+        file_path = _jsonl_path(file_path)
         row = {
             "meta": {"run_name": self.name, "timestamp": str(self.timestamp)},
+            "spec_hash": spec_hash(self.params),
             "dimensions": _cleaned(self.params),
             "metrics": {k: to_bsonable(v) for k, v in self.metrics.items()},
             "checkpoints": [

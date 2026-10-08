@@ -2,6 +2,7 @@ from tracking import observe
 from tracking.compare import add_reference_diffs
 from tracking.configurable import Configurable
 from tracking.experiment import Experiment, normalize_doc
+from tracking.hashing import spec_hash
 from tracking.driver import Sweep, execute, run, run_sweep
 from tracking.resolve import Resolver, ResolutionError
 from tracking.runnable import Runnable
@@ -22,4 +23,5 @@ __all__ = [
     "observe",
     "run",
     "run_sweep",
+    "spec_hash",
 ]
