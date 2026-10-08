@@ -349,25 +349,6 @@ wheels = [
 ]
 
 [[package]]
-name = "sacred"
-version = "0.8.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "colorama" },
-    { name = "docopt-ng" },
-    { name = "gitpython" },
-    { name = "jsonpickle" },
-    { name = "munch" },
-    { name = "packaging" },
-    { name = "py-cpuinfo" },
-    { name = "wrapt" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/be/6d/8b123a6b0336e263a0a0edc31fabb82fb3b7b6cb091ea6e92bff1f3902f1/sacred-0.8.7.tar.gz", hash = "sha256:c2a01d9b524c1d16076cb40c21071dc049bf68fe5f02a2cac78bbb3169e407d2", size = 110478, upload-time = "2024-11-26T07:16:53.839Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/01/d9/67a53f465395e0be45ac8f780938e0a551d82d4b864e5a9394ab66168432/sacred-0.8.7-py2.py3-none-any.whl", hash = "sha256:81bf159ebd1ccbbe5fcc37a15a94897dabb0616c21d1276b9064aa40c65c5099", size = 108245, upload-time = "2024-11-26T07:16:52.399Z" },
-]
-
-[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -400,23 +381,37 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
+    { name = "colorama" },
+    { name = "docopt-ng" },
+    { name = "gitpython" },
+    { name = "jsonpickle" },
+    { name = "munch" },
     { name = "numpy" },
+    { name = "packaging" },
     { name = "pandas" },
+    { name = "py-cpuinfo" },
     { name = "pyinstrument" },
     { name = "pymongo" },
-    { name = "sacred" },
     { name = "tenacity" },
+    { name = "wrapt" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "certifi", specifier = ">=2026.7.22" },
+    { name = "colorama", specifier = ">=0.4" },
+    { name = "docopt-ng", specifier = ">=0.9" },
+    { name = "gitpython", specifier = ">=3.0" },
+    { name = "jsonpickle", specifier = ">=2.2.0" },
+    { name = "munch", specifier = ">=2.5,<5.0" },
     { name = "numpy", specifier = ">=2.5.3" },
+    { name = "packaging", specifier = ">=18.0" },
     { name = "pandas", specifier = ">=3.0.6" },
+    { name = "py-cpuinfo", specifier = ">=4.0" },
     { name = "pyinstrument", specifier = ">=5.1.2" },
     { name = "pymongo", specifier = ">=4.18.2" },
-    { name = "sacred", specifier = ">=0.8.7" },
     { name = "tenacity", specifier = ">=9.1.4" },
+    { name = "wrapt", specifier = ">=1.0,<2.0" },
 ]
 
 [[package]]

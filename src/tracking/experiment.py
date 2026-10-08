@@ -13,10 +13,10 @@ from typing import Any, Dict, Iterator, Literal, Optional
 import certifi
 import numpy as np
 import pymongo
-import sacred
-from sacred.metrics_logger import linearize_metrics
-from sacred.observers import FileStorageObserver
-from sacred.observers.mongo import QueuedMongoObserver
+from tracking._vendor import sacred
+from tracking._vendor.sacred.metrics_logger import linearize_metrics
+from tracking._vendor.sacred.observers import FileStorageObserver
+from tracking._vendor.sacred.observers.mongo import QueuedMongoObserver
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from tracking import observe

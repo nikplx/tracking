@@ -1,6 +1,6 @@
 # tracking
 
-A lightweight, backend-agnostic experiment tracking and grid-sweep driver for numerical experiments, built on top of [Sacred](https://sacred.readthedocs.io).
+A lightweight, backend-agnostic experiment tracking and grid-sweep driver for numerical experiments. Run documents use the [Sacred](https://sacred.readthedocs.io) schema, produced by a copy of Sacred 0.8.7 vendored into `src/tracking/_vendor/` (upstream is unmaintained and broke on Python 3.14 / recent setuptools — see `src/tracking/_vendor/README.md`).
 
 ## Description
 
@@ -8,7 +8,7 @@ A lightweight, backend-agnostic experiment tracking and grid-sweep driver for nu
 
 It is built on:
 
-* [Sacred](https://sacred.readthedocs.io) for run documents, metrics and artifact storage
+* a vendored copy of [Sacred](https://sacred.readthedocs.io) for run documents, metrics and artifact storage
 * [PyMongo](https://pymongo.readthedocs.io) for the MongoDB backend
 * [pandas](https://pandas.pydata.org) for reading results back out
 
@@ -202,5 +202,5 @@ df.groupby("dimensions_tolerance")["metrics_iterations"].mean()
 
 ## Notes
 
-* `Experiment` drives Sacred's run lifecycle itself rather than going through `ex.run()`, so it can create one run per grid point without a single fixed `@ex.main` and without Sacred's background heartbeat thread (it flushes at each checkpoint instead). This relies on a handful of private Sacred methods, which is why `sacred` is pinned to an exact version (`==0.8.7`) rather than a range — bumping it needs re-checking that `Experiment.__enter__`/`__exit__` still match Sacred's internals.
+* `Experiment` drives the vendored Sacred run lifecycle itself rather than going through `ex.run()`, so it can create one run per grid point without a single fixed `@ex.main` and without Sacred's background heartbeat thread (it flushes at each checkpoint instead). This relies on a handful of private Sacred methods inside `src/tracking/_vendor/`; if the vendored copy is ever refreshed, re-check that `Experiment.__enter__`/`__exit__` still match its internals.
 * The Sacred `Experiment` object (`tracking.experiment.ex`) is a single module-level instance shared by every `tracking.Experiment` in a process. Run sweeps as separate processes (e.g. one per SLURM array task, as `run()` does) rather than from multiple threads in the same process.
