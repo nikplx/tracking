@@ -18,6 +18,13 @@ dependency graph -- so it doesn't matter whether ``matrix`` or
 ``preconditioner`` gets resolved "first"; whichever is asked for first
 resolves what it needs on demand, and everything is memoized per
 :class:`Resolver` instance.
+
+A factory may also declare ``**kwargs`` (a ``VAR_KEYWORD`` parameter). It
+then receives the residual spec: every plain spec entry that is neither
+consumed as a named parameter nor provided by a factory. That is the
+forwarding mechanism for composing runnables -- e.g. a reaction runner
+captures grid knobs it doesn't know by name (``n_laplace``,
+``cholesky_threshold``, ...) and merges them into each member's child spec.
 """
 
 from __future__ import annotations
@@ -62,9 +69,33 @@ class Resolver:
 
         kwargs = {
             name: self._build(name, stack + (key,))
-            for name in params
-            if name != "self" and (name in self.spec or name in self.factories)
+            for name, p in params.items()
+            if name != "self"
+            and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            and (name in self.spec or name in self.factories)
         }
+
+        var_kw = next(
+            (name for name, p in params.items()
+             if p.kind == inspect.Parameter.VAR_KEYWORD),
+            None,
+        )
+        if var_kw is not None:
+            # Residual config capture: forward plain spec entries that are
+            # neither consumed as named params nor provided by a factory.
+            # Splat them as individual keywords so they land *inside* the
+            # callee's **kwargs (assigning under the kwargs-param name would
+            # nest the dict one level too deep). This is how a composing
+            # Runnable (e.g. a reaction runner that re-enters a child
+            # Resolver per member) receives grid knobs it doesn't know by
+            # name -- they flow through to the child spec. Factory-named
+            # keys are excluded on purpose: they are dependencies the child
+            # builds itself (possibly per member), not config to inherit.
+            kwargs.update({
+                k: self._build(k, stack + (key,))
+                for k in self.spec
+                if k not in kwargs and k != var_kw and k not in self.factories
+            })
 
         obj = factory(**kwargs)
         self._built[key] = obj

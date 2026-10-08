@@ -48,6 +48,23 @@ def _main():
 _TRUNCATE_AT = 4000
 
 
+def dims_of(v: Any) -> dict[str, Any] | None:
+    """Return ``v.dims()`` if it defines that protocol, else ``None``.
+
+    The ``dims()`` protocol lets a parameter object control how it is
+    tracked: instead of falling through to ``str(v)`` (a verbose blob for
+    dataclasses carrying large payloads like geometries), the returned
+    dict of plain scalar values is stored. Only a ``dict`` return value
+    is honored; anything else falls through to the normal handling.
+    """
+    dims = getattr(v, "dims", None)
+    if callable(dims):
+        d = dims()
+        if isinstance(d, dict):
+            return d
+    return None
+
+
 def to_bsonable(v: Any) -> Any:
     """Convert arbitrary benchmark params/metrics into BSON-encodable values."""
     if v is None or isinstance(v, (bool, int, float, str)):
@@ -62,6 +79,9 @@ def to_bsonable(v: Any) -> Any:
         return {str(k): to_bsonable(x) for k, x in v.items()}
     if isinstance(v, (Path,)):
         return str(v)
+    d = dims_of(v)
+    if d is not None:
+        return {str(k): to_bsonable(x) for k, x in d.items()}
     if isinstance(v, Configurable):
         return v.__class__.__name__
     if hasattr(v, "name") and isinstance(v.name, str):
@@ -73,7 +93,30 @@ def to_bsonable(v: Any) -> Any:
 
 
 def _cleaned(params: Dict[str, Any]) -> Dict[str, Any]:
-    return {str(k): to_bsonable(v) for k, v in params.items()}
+    """Clean params for storage, expanding top-level ``dims()`` objects.
+
+    A top-level value defining ``dims()`` (see :func:`dims_of`) is replaced
+    by its dims entries, so dimensions stay flat scalar columns (e.g.
+    ``dataset``/``reaction``/``reaction_file``) instead of one verbose
+    stringified blob. The raw object is still available to the
+    :class:`~tracking.resolve.Resolver` -- this only affects what is
+    tracked. Explicit keys in ``params`` win on collision, processed in
+    order.
+    """
+    out: Dict[str, Any] = {}
+    for k, v in params.items():
+        if isinstance(v, (dict, list, tuple)):
+            continue
+        d = dims_of(v)
+        if d is not None:
+            for dk, dv in d.items():
+                out[str(dk)] = to_bsonable(dv)
+    # Explicit scalar keys win over expanded dims on collision: re-apply
+    # any plain (non-dims) entries last.
+    for k, v in params.items():
+        if isinstance(v, (dict, list, tuple)) or dims_of(v) is None:
+            out[str(k)] = to_bsonable(v)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -329,9 +372,10 @@ class Experiment:
         if backend != "mongodb":
             return False
         coll = get_runs_collection(collection or "runs")
+        cleaned = _cleaned(params)
         query = {
-            f"config.{k}": to_bsonable(v)
-            for k, v in params.items()
+            f"config.{k}": v
+            for k, v in cleaned.items()
             if k != "benchmark_name"
         }
         query["status"] = "COMPLETED"
