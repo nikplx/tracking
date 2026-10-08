@@ -13,6 +13,8 @@ from typing import Any, Dict, Iterator, Literal, Optional
 import certifi
 import numpy as np
 import pymongo
+import yaml
+
 from tracking._vendor import sacred
 from tracking._vendor.sacred.metrics_logger import linearize_metrics
 from tracking._vendor.sacred.observers import FileStorageObserver
@@ -27,6 +29,7 @@ logger = logging.getLogger()
 type Backend = Literal["mongodb", "file"]
 
 MONGO_DB = os.environ.get("TRACKING_MONGO_DB", "tracking")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 SACRED_EXPERIMENT = "benchmark"
 
 ex = sacred.Experiment(SACRED_EXPERIMENT, save_git_info=False)
@@ -212,13 +215,13 @@ class Experiment:
                 logger.warning(
                     "No MongoDB URL found; falling back to local file observer."
                 )
-                return [FileStorageObserver("sacred_runs")]
+                return [FileStorageObserver(DATA_DIR / "sacred_runs")]
             return [
                 QueuedMongoObserver(
                     url=url, db_name=MONGO_DB, collection=self.collection
                 )
             ]
-        return [FileStorageObserver("sacred_runs")]
+        return [FileStorageObserver(DATA_DIR / "sacred_runs")]
 
     def __enter__(self) -> "Experiment":
         self.timestamp = datetime.now()
@@ -231,6 +234,8 @@ class Experiment:
         )
 
         config = _cleaned(self.params)
+        logger.info("running experiment with config:\n" + yaml.dump(config))
+
         config["benchmark_name"] = self.name
         observers = self._make_observers()
         previous, ex.observers = ex.observers, observers
@@ -333,7 +338,7 @@ class Experiment:
         return coll.find_one(query, {"_id": 1}) is not None
 
     # -- legacy file backend ---------------------------------------------
-    def _save_to_jsonl(self, file_path: str = "experiments.jsonl") -> None:
+    def _save_to_jsonl(self, file_path: str = DATA_DIR/"experiments.jsonl") -> None:
         row = {
             "meta": {"run_name": self.name, "timestamp": str(self.timestamp)},
             "dimensions": _cleaned(self.params),
