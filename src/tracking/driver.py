@@ -28,7 +28,7 @@ from tracking.resolve import Factory, Resolver
 
 logger = logging.getLogger(__name__)
 
-Backend = Literal["mongodb", "file"]
+Backend = Literal["mongodb", "file", "mongo_compact"]
 
 
 @dataclass

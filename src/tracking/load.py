@@ -7,11 +7,11 @@ import pandas as pd
 from tracking import normalize_doc
 
 
-def load_mongo_data(collection, query: Optional[dict] = None):
+def load_mongo_data(collection, query):
     """Fetch a Mongo collection and return a normalized ``pandas.DataFrame``."""
     import pandas as pd
 
-    docs = list(collection.find(query or {}))
+    docs = collection.find(query)
     if not docs:
         return pd.DataFrame()
     return pd.DataFrame([normalize_doc(d) for d in docs])

@@ -32,7 +32,7 @@ from tracking.hashing import (
 
 logger = logging.getLogger()
 
-type Backend = Literal["mongodb", "file"]
+type Backend = Literal["mongodb", "file", "mongo_compact"]
 
 MONGO_DB = os.environ.get("TRACKING_MONGO_DB", "tracking")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
@@ -150,6 +150,9 @@ class Experiment:
         prev = self.checkpoint_log[-1]["timestamp"] if self.checkpoint_log else self.timestamp
         diff = (now - prev).total_seconds() if prev is not None else 0.0
         self.checkpoint_log.append({"name": name, "timestamp": now, "diff": diff})
+        if self.backend == "mongo_compact":
+            self._compact_upsert()
+            return
         if self._sacred_run is not None:
             self._sacred_run.info["checkpoints"] = [
                 {"name": c["name"], "timestamp": str(c["timestamp"]), "diff": c["diff"]}
@@ -211,6 +214,11 @@ class Experiment:
         config = _cleaned(self.params)
         logger.info("running experiment with config:\n" + yaml.dump(config))
 
+        if self.backend == "mongo_compact":
+            self._observe_token = observe.set_active(self)
+            self._compact_upsert(status="RUNNING")
+            return self
+
         config["benchmark_name"] = self.name
         # Dedup key: lets Experiment.exists find this run with a single
         # indexed lookup instead of one equality clause per dimension.
@@ -264,6 +272,14 @@ class Experiment:
             logger.error("benchmark run failed: %s", exc_val)
         else:
             self.metrics["status"] = "SUCCESS"
+
+        if self.backend == "mongo_compact":
+            self._compact_upsert(
+                status="FAILED" if exc_type else "COMPLETED")
+            if self._observe_token is not None:
+                observe.reset(self._observe_token)
+                self._observe_token = None
+            return False  # never suppress exceptions
 
         run = self._sacred_run
         if run is not None:
@@ -319,10 +335,50 @@ class Experiment:
                 {"config.spec_hash": h, "status": "COMPLETED"},
                 {"_id": 1},
             ) is not None
+        elif backend == "mongo_compact":
+            coll = get_runs_collection(collection or "runs")
+            try:
+                coll.create_index([("spec_hash", 1), ("status", 1)])
+            except Exception:
+                logger.debug("could not create spec_hash index", exc_info=True)
+            return coll.find_one(
+                {"spec_hash": h, "status": "COMPLETED"},
+                {"_id": 1},
+            ) is not None
         elif backend == "file":
             return h in _successful_file_hashes(_jsonl_path())
         else:
             return False
+
+    # -- compact mongo backend: one self-contained doc per run -----------
+    def _compact_doc(self, status: str) -> Dict[str, Any]:
+        """Same shape as a :meth:`_save_to_jsonl` row, plus query helpers."""
+        return {
+            "meta": {"run_name": self.name, "timestamp": str(self.timestamp)},
+            "spec_hash": spec_hash(self.params),
+            "dimensions": _cleaned(self.params),
+            "metrics": {k: to_bsonable(v) for k, v in self.metrics.items()},
+            "checkpoints": [
+                {"name": c["name"], "timestamp": str(c["timestamp"]), "diff": c["diff"]}
+                for c in self.checkpoint_log
+            ],
+            "status": status,
+            "updated": datetime.now(timezone.utc),
+        }
+
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, max=30))
+    def _compact_upsert(self, status: str | None = None) -> None:
+        """Insert-or-replace this run's doc, keyed by ``spec_hash``.
+
+        Persists on entry (``RUNNING``), every :meth:`checkpoint`, and exit
+        (``COMPLETED``/``FAILED``) — the same phase boundaries at which the
+        Sacred backend flushes, so long HPC runs leave resumable state.
+        """
+        st = status or self.metrics.get("status") or "RUNNING"
+        doc = self._compact_doc(st)
+        doc["metrics"]["status"] = self.metrics.get("status", st)
+        coll = get_runs_collection(self.collection)
+        coll.replace_one({"spec_hash": doc["spec_hash"]}, doc, upsert=True)
 
     # -- legacy file backend ---------------------------------------------
     def _save_to_jsonl(self, file_path=None) -> None:

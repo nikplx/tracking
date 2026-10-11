@@ -67,6 +67,9 @@ def to_bsonable(v: Any) -> Any:
         # Stable across processes: str() would embed a memory address,
         # making stored configs (and hashes over them) unmatchable.
         return v.__name__
+    if inspect.isclass(v):
+        # Fully qualified path, no "<class '…'>" brackets.
+        return f"{v.__module__}.{v.__qualname__}"
     if isinstance(v, Configurable):
         return v.__class__.__name__
     if hasattr(v, "name") and isinstance(v.name, str):
