@@ -20,15 +20,14 @@ import itertools
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator, Literal
+from typing import Any, Iterable, Iterator
 
 from pyinstrument import Profiler
-from tracking.experiment import Experiment
+from tracking import observe
+from tracking.experiment import Backend, Experiment
 from tracking.resolve import Factory, Resolver
 
 logger = logging.getLogger(__name__)
-
-Backend = Literal["mongodb", "file", "mongo_compact"]
 
 
 @dataclass
@@ -36,7 +35,7 @@ class Sweep:
     """One benchmark entry: what varies, and how to wire it up.
 
     No ``type`` field. Adding a new kind of run (a new system, a new
-    method) never touches this dataclass or ``run_benchmark`` below -- it's
+    method) never touches this dataclass or ``run_sweep`` below -- it's
     purely a new ``factories`` registry pointing ``entry`` at a new
     ``Runnable``.
     """
@@ -44,7 +43,7 @@ class Sweep:
     factories: dict[str, Factory]
     entry: str = "run"
     grid: dict[str, list[Any]] = field(default_factory=dict)
-    backend: Backend = "mongodb"
+    backend: Backend = "mongo_compact"
     collection: str | None = None
     checkpoint: bool = False
     profile: bool = False
@@ -66,7 +65,7 @@ def execute(
     entry: str,
     factories: dict[str, Factory],
     *,
-    backend: Backend = "mongodb",
+    backend: Backend = "mongo_compact",
     collection: str | None = None,
     checkpoint: bool = False,
     profile: bool = False,
@@ -91,14 +90,18 @@ def execute(
     with Experiment(name=name, params=factory_spec, backend=backend,
                     checkpoints=checkpoint, collection=collection) as run:
         runnable = Resolver(spec, factories).build(entry)
+        observe.checkpoint("init_resolve")
 
         profiler_cm = Profiler() if profile else nullcontext()
         with profiler_cm as profiler:
             runnable.kernel()
 
+        observe.checkpoint("run_completed")
+
         if profile and profiler is not None:
             run.add_profile(profiler)
 
+        observe.checkpoint("build_profile")
 
 def run_sweep(name: str, sweep: Sweep) -> None:
     """Run every point in ``bm``'s grid, one :class:`Experiment` each.

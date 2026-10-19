@@ -2,7 +2,7 @@
 
 Pure helpers with no dependency on run lifecycle state: cleaning arbitrary
 params into BSON/JSON-safe dimensions, hashing them into a stable dedup
-key, and looking that key up in either backend. :mod:`tracking.experiment`
+key, and looking that key up in the configured backend. :mod:`tracking.experiment`
 owns the run lifecycle and imports from here.
 """
 
@@ -11,15 +11,12 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-import logging
 from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
 
 from tracking.configurable import Configurable
-
-logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -130,20 +127,6 @@ def spec_hash(params: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Backend lookups for the dedup key
 # ---------------------------------------------------------------------------
-
-_HASH_INDEX_ENSURED: set[str] = set()
-
-
-def _ensure_hash_index(coll, namespace: str) -> None:
-    """Best-effort compound index for the dedup lookup (once per process)."""
-    if namespace in _HASH_INDEX_ENSURED:
-        return
-    try:
-        coll.create_index([("config.spec_hash", 1), ("status", 1)])
-        _HASH_INDEX_ENSURED.add(namespace)
-    except Exception:
-        logger.debug("could not create spec_hash index on %s", namespace, exc_info=True)
-
 
 # Incremental scan state for the file backend: path -> [mtime, size, offset, hashes].
 _FILE_HASH_CACHE: dict[str, list] = {}

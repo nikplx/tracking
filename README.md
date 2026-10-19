@@ -1,15 +1,15 @@
 # tracking
 
-A lightweight, backend-agnostic experiment tracking and grid-sweep driver for numerical experiments. Run documents use the [Sacred](https://sacred.readthedocs.io) schema, produced by a copy of Sacred 0.8.7 vendored into `src/tracking/_vendor/` (upstream is unmaintained and broke on Python 3.14 / recent setuptools — see `src/tracking/_vendor/README.md`).
+A lightweight, backend-agnostic experiment tracking and grid-sweep driver for numerical experiments. The compact MongoDB backend stores one self-contained document per run; the file backend uses the [Sacred](https://sacred.readthedocs.io) run-document schema, produced by a copy of Sacred 0.8.7 vendored into `src/tracking/_vendor/` (upstream is unmaintained and broke on Python 3.14 / recent setuptools — see `src/tracking/_vendor/README.md`).
 
 ## Description
 
-`tracking` solves one recurring problem: you have a library that does some numerical computation (a solver, a simulation, a model fit), and you want to run it many times over a cross product of configuration dimensions — algorithm variants, parameters, input datasets — while recording not just the final result but internal metrics, per-phase timings, and whatever the computation chooses to log from deep inside, and you want the results to end up in MongoDB, a local file, or both, interchangeably.
+`tracking` solves one recurring problem: you have a library that does some numerical computation (a solver, a simulation, a model fit), and you want to run it many times over a cross product of configuration dimensions — algorithm variants, parameters, input datasets — while recording not just the final result but internal metrics, per-phase timings, and whatever the computation chooses to log from deep inside, and you want the results to end up as compact MongoDB documents, as local files, or both, interchangeably.
 
 It is built on:
 
-* a vendored copy of [Sacred](https://sacred.readthedocs.io) for run documents, metrics and artifact storage
-* [PyMongo](https://pymongo.readthedocs.io) for the MongoDB backend
+* a vendored copy of [Sacred](https://sacred.readthedocs.io) for run documents, metrics and artifact storage (used by the file backend)
+* [PyMongo](https://pymongo.readthedocs.io) for the compact MongoDB backend
 * [pandas](https://pandas.pydata.org) for reading results back out
 
 The design has one rule: **your library never imports `tracking`'s backend.** It only ever talks to `tracking.observe`, a tiny no-op-by-default interface. Whether a run is being tracked at all, and where it ends up, is entirely up to whoever is driving the sweep.
@@ -77,7 +77,7 @@ with Experiment(name="solver_sweep", params=params, backend="file") as run:
     run.log_metric("rank", factors.rank)
 ```
 
-Inside the `with` block, `observe.log_metric`/`observe.checkpoint`/`observe.measure` calls made by `solve` land on this exact run, right alongside `run.log_metric("rank", ...)` called directly. Metrics logged as plain scalars (`bool`/`int`/`float`) are additionally recorded as a time series (via Sacred's `log_scalar`), so you get both "the last value" and "the value over the run" for free.
+Inside the `with` block, `observe.log_metric`/`observe.checkpoint`/`observe.measure` calls made by `solve` land on this exact run, right alongside `run.log_metric("rank", ...)` called directly. With the file backend, metrics logged as plain scalars (`bool`/`int`/`float`) are additionally recorded as a time series (via Sacred's `log_scalar`), so you get both "the last value" and "the value over the run" for free. The compact MongoDB backend stores the latest value per metric; use `run.append_metric` / `observe.append_metric` when you explicitly need a list of values.
 
 `run.checkpoint(name)` records a named phase boundary with the time elapsed since the previous checkpoint — useful for seeing where time actually goes inside a long calculation, not just the total wall time:
 
@@ -134,7 +134,7 @@ runnable = Resolver(spec, factories).build("run")
 runnable.kernel()
 ```
 
-`Resolver` asks for `"run"` → needs `matrix`, `tolerance`, `preconditioner` → `tolerance` is already in `spec`, `matrix` and `preconditioner` are built from their own factories (each resolving *their* dependencies the same way), and the whole graph is built in the right order regardless of which key you ask for first. Every value a literal in `spec` always wins over a factory with the same name, and each key is only built once per `Resolver` (so `matrix` is built once even though both `IterativeSolver` and `build_jacobi` depend on it).
+`Resolver` asks for `"run"` → needs `matrix`, `tolerance`, `preconditioner` → `tolerance` is already in `spec`, `matrix` and `preconditioner` are built from their own factories (each resolving *their* dependencies the same way), and the whole graph is built in the right order regardless of which key you ask for first. Every literal value in `spec` always wins over a factory with the same name, and each key is only built once per `Resolver` (so `matrix` is built once even though both `IterativeSolver` and `build_jacobi` depend on it).
 
 ### Describing a sweep: `Sweep` and the grid
 
@@ -154,14 +154,16 @@ bm = Sweep(
     },
     factories=factories,
     entry="run",
-    backend="mongodb",
+    backend="mongo_compact",
     collection="solver_sweep_v1",
 )
 
 run_sweep("solver_sweep", bm)
 ```
 
-This runs `2 cases × 3 tolerances × 2 preconditioners = 12` points, one `Experiment` each. A run that already completed with the exact same spec (checked against MongoDB) is skipped, so re-running the same sweep after adding one more `tolerance` value only runs the new points. A point that raises (a solver that fails to converge, a bad input file) is recorded as a `FAILED` run and the sweep keeps going — call `execute(...)` directly instead of `run_sweep` if you want a failure to stop you immediately, e.g. while developing a new `Runnable`.
+This runs `2 cases × 3 tolerances × 2 preconditioners = 12` points, one `Experiment` each. A run that already completed with the exact same spec (checked against the configured backend via its spec hash) is skipped, so re-running the same sweep after adding one more `tolerance` value only runs the new points. A point that raises (a solver that fails to converge, a bad input file) is recorded as a `FAILED` run and the sweep keeps going — call `execute(...)` directly instead of `run_sweep` if you want a failure to stop you immediately, e.g. while developing a new `Runnable`.
+
+Other `Sweep` fields: `checkpoint=True` flushes at every `observe.checkpoint` (useful for long HPC runs), `profile=True` attaches a [pyinstrument](https://github.com/joerick/pyinstrument) HTML report (file backend only), and `overwrite=True` skips the completed-run check and reruns every point.
 
 ### Running a sweep from the command line
 
@@ -186,21 +188,53 @@ python sweep.py                        # run everything
 
 ### Backends
 
-`backend="mongodb"` (the default) writes each run as a Sacred document via `QueuedMongoObserver`, queuing writes so a flaky HPC network doesn't lose data. It needs a connection string in the `MONGODB_URL` or `MONGO_URL` environment variable, and defaults to the `tracking` database — override with `TRACKING_MONGO_DB`. If no URL is set, it logs a warning and falls back to the file backend rather than failing the run.
+There are two backends:
 
-`backend="file"` writes a full Sacred run directory under `./sacred_runs/<id>/` (config, metrics, captured output) and appends one flat JSON row per run to `./experiments.jsonl` in the current directory, for quick loading without walking the Sacred directory tree.
+* `backend="mongo_compact"` (the default) writes **one self-contained document per run** to MongoDB, keyed by `spec_hash`. The document holds `meta`, `dimensions`, `metrics`, `checkpoints`, `status` (`RUNNING`/`COMPLETED`/`FAILED`) and `updated`. It is written on entry, at every `observe.checkpoint`, and on exit, with retrying writes so a flaky HPC network does not lose progress. Connection settings:
+  * `MONGODB_URL` or `MONGO_URL` — connection string (required; a clear error is raised if neither is set)
+  * `TRACKING_MONGO_DB` — database name (default `tracking`)
+  * `collection=` on `Experiment`/`Sweep` — collection name (default `runs`)
+* `backend="file"` writes a full Sacred run directory under `$DATA_DIR/sacred_runs/<id>/` (config, metrics, captured output) and appends one flat JSON row per run to `$DATA_DIR/experiments.jsonl`, for quick loading without walking the Sacred directory tree. `DATA_DIR` defaults to the current directory.
 
-Reading a MongoDB collection back into a flat `pandas.DataFrame` (one `dimensions_*`/`metrics_*` column per config/info key):
+The old `backend="mongodb"` option (full Sacred run documents via `QueuedMongoObserver`) has been removed; use `backend="mongo_compact"` instead. Collections written by the old backend are still readable through `normalize_doc` / `load_mongo_data`.
+
+### Reading results back
+
+Both backends normalize to the same flat `pandas.DataFrame` shape (one `dimensions_*` / `metrics_*` column per config/metric key):
 
 ```python
-from tracking.experiment import get_runs_collection
-from tracking import load_runs_df
+from pathlib import Path
 
-df = load_runs_df(get_runs_collection("solver_sweep_v1"))
-df.groupby("dimensions_tolerance")["metrics_iterations"].mean()
+from tracking import load_json_data, load_mongo_data
+from tracking.experiment import get_runs_collection
+
+mongo_df = load_mongo_data(
+    get_runs_collection("solver_sweep_v1"),
+    {"status": "COMPLETED"},  # pass {} to read every status
+)
+file_df = load_json_data(Path("./experiments.jsonl"))
+
+mongo_df.groupby("dimensions_tolerance")["metrics_iterations"].mean()
+```
+
+`get_runs_collection(name)` uses the same `MONGODB_URL`/`MONGO_URL` and `TRACKING_MONGO_DB` settings as the compact backend. `load_mongo_data(collection, query)` needs an explicit query; `load_json_data(path)` skips a half-written final line from a live run.
+
+### Comparing runs against a baseline
+
+`add_reference_diffs` joins each run to the matching reference row (same `keys`) and adds `<metric>_vs_ref`, `<metric>_vs_ref_pct`, and `<metric>_vs_ref_abs` columns. By default it auto-discovers `metrics_*` columns and returns only the non-reference rows; pass `return_reference=True` to keep both, or `metrics=[...]` to choose columns explicitly:
+
+```python
+from tracking import add_reference_diffs
+
+diffed = add_reference_diffs(
+    mongo_df,
+    group="dimensions_preconditioner_kind",
+    reference="none",
+    keys=["dimensions_matrix_path", "dimensions_tolerance"],
+)
 ```
 
 ## Notes
 
-* `Experiment` drives the vendored Sacred run lifecycle itself rather than going through `ex.run()`, so it can create one run per grid point without a single fixed `@ex.main` and without Sacred's background heartbeat thread (it flushes at each checkpoint instead). This relies on a handful of private Sacred methods inside `src/tracking/_vendor/`; if the vendored copy is ever refreshed, re-check that `Experiment.__enter__`/`__exit__` still match its internals.
-* The Sacred `Experiment` object (`tracking.experiment.ex`) is a single module-level instance shared by every `tracking.Experiment` in a process. Run sweeps as separate processes (e.g. one per SLURM array task, as `run()` does) rather than from multiple threads in the same process.
+* The **file backend** drives the vendored Sacred run lifecycle itself rather than going through `ex.run()`, so it can create one run per grid point without a single fixed `@ex.main` and without Sacred's background heartbeat thread (it flushes at each checkpoint instead). This relies on a handful of private Sacred methods inside `src/tracking/_vendor/`; if the vendored copy is ever refreshed, re-check that `Experiment.__enter__`/`__exit__` still match its internals. The compact MongoDB backend does not use Sacred's run object.
+* The Sacred `Experiment` object (`tracking.experiment.ex`) is a single module-level instance shared by every file-backed `tracking.Experiment` in a process. Run sweeps as separate processes (e.g. one per SLURM array task, as `run()` does) rather than from multiple threads in the same process.

@@ -17,14 +17,12 @@ import yaml
 
 from tracking._vendor import sacred
 from tracking._vendor.sacred.metrics_logger import linearize_metrics
-from tracking._vendor.sacred.observers import FileStorageObserver
-from tracking._vendor.sacred.observers.mongo import QueuedMongoObserver
+from tracking._vendor.sacred.observers.file_storage import FileStorageObserver
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from tracking import observe
 from tracking.hashing import (
     _cleaned,
-    _ensure_hash_index,
     _successful_file_hashes,
     spec_hash,
     to_bsonable,
@@ -32,7 +30,7 @@ from tracking.hashing import (
 
 logger = logging.getLogger()
 
-type Backend = Literal["mongodb", "file", "mongo_compact"]
+type Backend = Literal["file", "mongo_compact"]
 
 MONGO_DB = os.environ.get("TRACKING_MONGO_DB", "tracking")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
@@ -43,7 +41,7 @@ ex = sacred.Experiment(SACRED_EXPERIMENT, save_git_info=False)
 
 @ex.main
 def _main():
-    """Dummy command: runs are driven manually via :class:`BenchmarkRun`."""
+    """Dummy command: runs are driven manually via :class:`Experiment`."""
     return None
 
 
@@ -84,17 +82,19 @@ def _jsonl_path(file_path=None) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# BenchmarkRun
+# Experiment
 # ---------------------------------------------------------------------------
 
 class Experiment:
-    """One experiment calculation, tracked with Sacred.
+    """One experiment calculation, tracked with Sacred or the compact backend.
 
-    Mirrors the old ``ExperimentRun`` workflow so ``benchmark.py`` barely
-    changes::
+    ``backend="file"`` drives a Sacred run with a
+    :class:`~tracking._vendor.sacred.observers.FileStorageObserver`;
+    ``backend="mongo_compact"`` (the default) writes one self-contained
+    MongoDB document per run::
 
-        with BenchmarkRun(name, params, backend="mongodb",
-                          collection="sparsity_v1") as run:
+        with Experiment(name, params, backend="mongo_compact",
+                        collection="sparsity_v1") as run:
             ...
             run.log_metric("energy", value)
     """
@@ -103,12 +103,16 @@ class Experiment:
         self,
         name: str,
         params: Dict[str, Any],
-        backend: Backend = "mongodb",
+        backend: Backend = "mongo_compact",
         checkpoints: bool = True,
         collection: Optional[str] = None,
     ):
         self.name = name
         self.params = params
+        if backend not in ("file", "mongo_compact"):
+            raise ValueError(
+                f"unknown backend {backend!r}; expected 'mongo_compact' or 'file'"
+            )
         self.backend = backend
         self.checkpoint_enabled = checkpoints
         self.collection = collection or "runs"
@@ -185,22 +189,6 @@ class Experiment:
             os.unlink(path)
 
     # -- lifecycle -------------------------------------------------------
-    def _make_observers(self):
-        if self.backend == "mongodb":
-            try:
-                url = get_mongo_url()
-            except ValueError:
-                logger.warning(
-                    "No MongoDB URL found; falling back to local file observer."
-                )
-                return [FileStorageObserver(DATA_DIR / "sacred_runs")]
-            return [
-                QueuedMongoObserver(
-                    url=url, db_name=MONGO_DB, collection=self.collection
-                )
-            ]
-        return [FileStorageObserver(DATA_DIR / "sacred_runs")]
-
     def __enter__(self) -> "Experiment":
         self.timestamp = datetime.now()
         self.start_time = time.perf_counter()
@@ -223,7 +211,7 @@ class Experiment:
         # Dedup key: lets Experiment.exists find this run with a single
         # indexed lookup instead of one equality clause per dimension.
         config["spec_hash"] = spec_hash(self.params)
-        observers = self._make_observers()
+        observers = [FileStorageObserver(DATA_DIR / "sacred_runs")]
         previous, ex.observers = ex.observers, observers
         try:
             # ``force``: benchmark params are dynamic (one grid point's spec
@@ -317,7 +305,7 @@ class Experiment:
     def exists(
         cls,
         params: Dict[str, Any],
-        backend: Backend = "mongodb",
+        backend: Backend = "mongo_compact",
         collection: Optional[str] = None,
     ) -> bool:
         """Skip check: is there a completed run with these dimensions?
@@ -328,14 +316,7 @@ class Experiment:
         once, then carry the hash going forward).
         """
         h = spec_hash(params)
-        if backend == "mongodb":
-            coll = get_runs_collection(collection or "runs")
-            _ensure_hash_index(coll, f"{MONGO_DB}.{collection or 'runs'}")
-            return coll.find_one(
-                {"config.spec_hash": h, "status": "COMPLETED"},
-                {"_id": 1},
-            ) is not None
-        elif backend == "mongo_compact":
+        if backend == "mongo_compact":
             coll = get_runs_collection(collection or "runs")
             try:
                 coll.create_index([("spec_hash", 1), ("status", 1)])
@@ -348,7 +329,7 @@ class Experiment:
         elif backend == "file":
             return h in _successful_file_hashes(_jsonl_path())
         else:
-            return False
+            raise ValueError(f"unknown backend: {backend!r}")
 
     # -- compact mongo backend: one self-contained doc per run -----------
     def _compact_doc(self, status: str) -> Dict[str, Any]:
@@ -372,7 +353,7 @@ class Experiment:
 
         Persists on entry (``RUNNING``), every :meth:`checkpoint`, and exit
         (``COMPLETED``/``FAILED``) — the same phase boundaries at which the
-        Sacred backend flushes, so long HPC runs leave resumable state.
+        file backend flushes, so long HPC runs leave resumable state.
         """
         st = status or self.metrics.get("status") or "RUNNING"
         doc = self._compact_doc(st)
@@ -380,7 +361,7 @@ class Experiment:
         coll = get_runs_collection(self.collection)
         coll.replace_one({"spec_hash": doc["spec_hash"]}, doc, upsert=True)
 
-    # -- legacy file backend ---------------------------------------------
+    # -- file backend ----------------------------------------------------
     def _save_to_jsonl(self, file_path=None) -> None:
         file_path = _jsonl_path(file_path)
         row = {
@@ -399,19 +380,21 @@ class Experiment:
 
 
 # ---------------------------------------------------------------------------
-# Reading mixed collections (legacy + Sacred docs) with pandas
+# Reading compact and older Sacred collections with pandas
 # ---------------------------------------------------------------------------
 
 def normalize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     """Flatten one Mongo document into ``dimensions_*`` / ``metrics_*`` columns.
 
-    Handles both the legacy shape (``dimensions`` / ``metrics`` / ``meta``)
-    and Sacred run documents (``config`` / ``info`` / ``status``).
+    Handles both the compact shape written by this package (``dimensions`` /
+    ``metrics`` / ``meta``) and the older Sacred run-document shape
+    (``config`` / ``info`` / ``status``), so collections written before the
+    compact backend still load.
     """
     flat: Dict[str, Any] = {}
     if "_id" in doc:
         flat["_id"] = str(doc["_id"])
-    if "config" in doc:  # Sacred shape
+    if "config" in doc:  # older Sacred shape
         for k, v in (doc.get("config") or {}).items():
             flat[f"dimensions_{k}"] = v
         for k, v in (doc.get("info") or {}).items():
@@ -430,7 +413,7 @@ def normalize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         host = doc.get("host_info") or doc.get("host") or {}
         if host.get("hostname"):
             flat["meta_hostname"] = host["hostname"]
-    else:  # legacy shape
+    else:  # compact shape
         for section, prefix in (("meta", "meta"), ("dimensions", "dimensions"), ("metrics", "metrics")):
             for k, v in (doc.get(section) or {}).items():
                 flat[f"{prefix}_{k}"] = v

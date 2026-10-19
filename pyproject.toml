@@ -1,7 +1,7 @@
 [project]
 name = "tracking"
 version = "0.1.0"
-description = "A lightweight, backend-agnostic experiment tracking and grid-sweep driver for numerical experiments, backed by a vendored copy of Sacred."
+description = "A lightweight, backend-agnostic experiment tracking and grid-sweep driver for numerical experiments, with compact MongoDB and Sacred-backed local file backends."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"

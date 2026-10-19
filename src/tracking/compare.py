@@ -88,6 +88,10 @@ def add_reference_diffs(
 
     n_other = int((~out["is_reference"]).sum())
     worst_unmatched = 0
+    # Collect all derived columns first and join once: inserting them one
+    # by one fragments the frame (PerformanceWarning) when many metrics
+    # are diffed.
+    new_cols: dict[str, pd.Series] = {}
     for metric in metrics:
         ref_col = f"{metric}_ref"
         # Cast to float for the arithmetic: a boolean metric (e.g.
@@ -98,15 +102,17 @@ def add_reference_diffs(
         values = out[metric].astype(float)
 
         ref_values = out[ref_col].astype(float)
-        out[f"{metric}{suffix}"] = values - ref_values
+        diff = values - ref_values
+        new_cols[f"{metric}{suffix}"] = diff
 
-        pct = (out[f"{metric}{suffix}"] / ref_values) * 100.0
-        out[f"{metric}{suffix}_pct"] = pct.replace([np.inf, -np.inf], np.nan)
+        pct = (diff / ref_values) * 100.0
+        new_cols[f"{metric}{suffix}_pct"] = pct.replace([np.inf, -np.inf], np.nan)
 
-        out[f"{metric}{suffix}_abs"] = out[f"{metric}{suffix}"].abs()
+        new_cols[f"{metric}{suffix}_abs"] = diff.abs()
 
         unmatched = int((out[ref_col].isna() & ~out["is_reference"]).sum())
         worst_unmatched = max(worst_unmatched, unmatched)
+    out = pd.concat([out, pd.DataFrame(new_cols, index=out.index)], axis=1)
 
     if worst_unmatched:
         logger.warning(
