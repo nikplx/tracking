@@ -1,5 +1,4 @@
 import inspect
-import json
 
 import pytest
 
@@ -33,28 +32,10 @@ def test_default_backend_is_compact_mongo():
     assert Sweep(cases=[], factories={}).backend == "mongo_compact"
 
 
-@pytest.mark.parametrize("backend", ["mongodb", "unknown"])
+@pytest.mark.parametrize("backend", ["mongodb", "file", "unknown"])
 def test_removed_or_unknown_backend_is_rejected(backend):
     with pytest.raises(ValueError, match="unknown backend"):
         Experiment("run", {}, backend=backend)
-
-
-def test_file_backend_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.setattr(experiment, "DATA_DIR", tmp_path)
-
-    with Experiment("run", {"x": 1}, backend="file") as run:
-        observe.log_metric("energy", 1.5)
-        observe.checkpoint("done")
-
-    assert Experiment.exists({"x": 1}, backend="file")
-
-    rows = (tmp_path / "experiments.jsonl").read_text(encoding="utf-8").splitlines()
-    row = json.loads(rows[0])
-    assert row["dimensions"] == {"x": 1}
-    assert row["metrics"]["energy"] == 1.5
-    assert row["metrics"]["status"] == "SUCCESS"
-    assert row["checkpoints"][0]["name"] == "done"
-    assert (tmp_path / "sacred_runs").is_dir()
 
 
 def test_compact_backend_roundtrip(monkeypatch):

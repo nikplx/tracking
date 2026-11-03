@@ -5,7 +5,7 @@ import tracking.project as project_module
 from tracking import Experiment, observe
 from tracking.project import FrozenProjectError, Project
 from tracking.provenance import tree_fingerprint
-from tracking.store import ContentStore
+from tracking.store import LocalStore
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ def test_tracking_project_env_selects_default_db(monkeypatch):
 def test_project_store_uses_configured_root(tmp_path):
     project = Project("p", store_root=tmp_path / "store")
     assert project.store.root == tmp_path / "store"
-    assert isinstance(project.store, ContentStore)
+    assert isinstance(project.store, LocalStore)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +208,7 @@ def test_explicit_project_rejects_writes_when_frozen(fake_collection, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_store_objects_are_idempotent(tmp_path):
-    store = ContentStore(tmp_path / "store")
+    store = LocalStore(tmp_path / "store")
     sha = store.put_bytes(b"hello")
     again = store.put_bytes(b"hello")
     assert sha == again
@@ -223,7 +223,7 @@ def test_store_tree_is_deterministic(tmp_path):
     (source / "sub" / "b.txt").write_text("b", encoding="utf-8")
 
     tree = tree_fingerprint(source)
-    store = ContentStore(tmp_path / "store")
+    store = LocalStore(tmp_path / "store")
 
     first = store.put_tree(source, tree)
     archive = store.tree_path(tree["tree_hash"])

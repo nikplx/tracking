@@ -36,21 +36,43 @@ def default_db_name() -> str:
     return os.environ.get("TRACKING_MONGO_DB", "tracking")
 
 
-def default_store_root() -> Path:
+def default_store_root() -> str | Path:
     """Store location, honouring ``TRACKING_STORE`` then ``DATA_DIR``.
 
+    ``TRACKING_STORE`` may be a plain path or a ``s3://bucket/prefix`` URI
+    (see :func:`make_store`); URIs are returned as-is, never wrapped in
+    ``Path``, which would otherwise mangle the ``://`` separator.
     ``DATA_DIR`` is read from :mod:`tracking.experiment` when available so
     tests and callers that monkeypatch it keep working.
     """
     env = os.environ.get("TRACKING_STORE")
     if env:
-        return Path(env)
+        return env if "://" in env else Path(env)
     try:
         from tracking.experiment import DATA_DIR
 
         return Path(DATA_DIR) / "tracking_store"
     except Exception:
         return Path(os.environ.get("DATA_DIR", ".")) / "tracking_store"
+
+
+def make_store(store_root: str | Path):
+    """Build the :class:`~tracking.store.Store` backend named by ``store_root``.
+
+    An ``s3://bucket/prefix`` string dispatches to
+    :class:`tracking.store_s3.S3Store` (which requires the ``tracking[s3]``
+    extra); anything else is a local directory, backed by
+    :class:`tracking.store.LocalStore`.
+    """
+    text = str(store_root)
+    if text.startswith("s3://"):
+        from tracking.store_s3 import S3Store
+
+        bucket, _, prefix = text[len("s3://") :].partition("/")
+        return S3Store(bucket, prefix)
+    from tracking.store import LocalStore
+
+    return LocalStore(store_root)
 
 
 @dataclass
@@ -78,10 +100,11 @@ class Project:
     @property
     def store(self):
         if self._store is None:
-            from tracking.store import ContentStore
-
-            self._store = ContentStore(self.store_root)
+            self._store = make_store(self.store_root)
         return self._store
+
+    def artifact_uri(self, sha: str) -> str:
+        return self.store.uri(sha)
 
     def client(self):
         from tracking.experiment import get_mongo_client
@@ -106,6 +129,42 @@ class Project:
         return sorted(
             n for n in names if not n.startswith("_") and not n.startswith("system.")
         )
+
+    def load_artifact(
+        self, descriptor: dict | str, dest: Path | str | None = None
+    ) -> bytes | Path:
+        """Fetch an artifact previously written by ``Experiment.add_artifact``.
+
+        ``descriptor`` is either the dict returned by ``add_artifact``/found
+        in a run document's ``artifacts`` list, or a raw sha256. Returns raw
+        bytes, or a materialized file path when ``dest`` is given.
+        """
+        sha = descriptor["sha256"] if isinstance(descriptor, dict) else descriptor
+        if dest is None:
+            return self.store.get_bytes(sha)
+        return self.store.get_file(sha, dest)
+
+    def artifacts(self, collection: str | None = None, query: dict | None = None):
+        """One row per artifact across matching runs, newest fields flat.
+
+        Mirrors :meth:`status`'s shape convention: iterates the same
+        ``(collection, doc)`` pairs and explodes each doc's ``artifacts``
+        list, tagging every row with the run it came from.
+        """
+        import pandas as pd
+
+        rows: list[dict] = []
+        for name, doc in self._iter_docs(collection, query):
+            for artifact in doc.get("artifacts") or []:
+                rows.append(
+                    {
+                        **artifact,
+                        "collection": name,
+                        "spec_hash": doc.get("spec_hash"),
+                        "run_key": doc.get("run_key"),
+                    }
+                )
+        return pd.DataFrame(rows)
 
     def status(self, collection: str | None = None, query: dict | None = None):
         """Runs plus a computed ``validity`` column.

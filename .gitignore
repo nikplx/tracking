@@ -12,3 +12,7 @@ wheels/
 .idea
 .serena
 .claude
+
+# Default local content-addressed store (DATA_DIR/tracking_store), created
+# when a test or script runs without an explicit store_root.
+/tracking_store/

@@ -5,9 +5,13 @@ the source tree — is stored by content hash under a single root, so identical
 content is never written twice and every reference in a run document is
 verifiable.
 
-Layout::
+``Store`` is the protocol every backend satisfies; :class:`LocalStore` is the
+plain-filesystem implementation. ``tracking.store_s3.S3Store`` implements the
+same protocol against an S3-compatible bucket.
 
-    <root>/objects/<sha[:2]>/<sha>      # arbitrary blobs (inputs)
+Local layout::
+
+    <root>/objects/<sha[:2]>/<sha>      # arbitrary blobs (inputs, artifacts)
     <root>/trees/<tree_hash>.tar.gz     # source-tree snapshots, keyed by tree hash
 
 Pure stdlib: :mod:`tarfile` and :mod:`gzip`, no extra dependencies.
@@ -18,10 +22,11 @@ from __future__ import annotations
 import gzip
 import hashlib
 import os
+import shutil
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Protocol, runtime_checkable
 
 # Directories that are never part of a source snapshot or tree hash.
 DEFAULT_EXCLUDES = frozenset(
@@ -73,10 +78,94 @@ def hash_file(path: Path | str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Store
+# Store protocol
 # ---------------------------------------------------------------------------
 
-class ContentStore:
+@runtime_checkable
+class Store(Protocol):
+    """A content-addressed blob store: local disk, S3, or anything else."""
+
+    def has(self, sha: str) -> bool: ...
+    def put_bytes(self, data: bytes) -> str: ...
+    def put_file(self, path: Path | str) -> str: ...
+    def get_bytes(self, sha: str) -> bytes: ...
+    def get_file(self, sha: str, dest: Path | str | None = None) -> Path:
+        """Materialize object ``sha`` as a real file and return its path."""
+        ...
+
+    def uri(self, sha: str) -> str:
+        """A stable locator for object ``sha`` (``file://...``, ``s3://...``)."""
+        ...
+
+    def has_tree(self, tree_hash: str) -> bool: ...
+    def put_tree(self, root: Path | str, tree: dict, excludes: Iterable[str] = ()) -> dict: ...
+
+
+# ---------------------------------------------------------------------------
+# Tree archives (shared by every backend)
+# ---------------------------------------------------------------------------
+
+def _is_excluded(rel: str, excluded_roots: Iterable[str]) -> bool:
+    parts = Path(rel).parts
+    for root in excluded_roots:
+        root_parts = Path(root).parts
+        if parts[: len(root_parts)] == root_parts:
+            return True
+    return False
+
+
+def write_tree_archive(
+    root: Path | str,
+    tree: dict,
+    excludes: Iterable[str],
+    out_path: Path,
+) -> None:
+    """Write a deterministic ``tar.gz`` of ``tree``'s files to ``out_path``.
+
+    ``tree`` is the result of :func:`tracking.provenance.tree_fingerprint`
+    and supplies the member list. Member metadata is zeroed and gzip's mtime
+    pinned so the archive is byte-reproducible; shared by every
+    :class:`Store` backend's ``put_tree``.
+    """
+    root = Path(root)
+    excluded_roots = tuple(DEFAULT_EXCLUDES) + tuple(excludes)
+    leaves = [
+        rel
+        for rel in tree.get("files", ())
+        if not _is_excluded(rel, excluded_roots)
+    ]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=out_path.parent, prefix=".tmp-", suffix=".tar.gz")
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as gz:
+                with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+                    for rel in sorted(leaves):
+                        path = root / rel
+                        if not path.is_file():
+                            continue
+                        info = tar.gettarinfo(str(path), arcname=rel)
+                        info.mtime = 0
+                        info.uid = info.gid = 0
+                        info.uname = info.gname = ""
+                        with open(path, "rb") as f:
+                            tar.addfile(info, f)
+        os.replace(tmp, out_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# LocalStore
+# ---------------------------------------------------------------------------
+
+class LocalStore:
     """A directory of immutable, content-addressed objects."""
 
     def __init__(self, root: Path | str):
@@ -114,6 +203,18 @@ class ContentStore:
     def get_bytes(self, sha: str) -> bytes:
         return self.object_path(sha).read_bytes()
 
+    def get_file(self, sha: str, dest: Path | str | None = None) -> Path:
+        source = self.object_path(sha)
+        if dest is None:
+            return source
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest)
+        return dest
+
+    def uri(self, sha: str) -> str:
+        return self.object_path(sha).resolve().as_uri()
+
     # -- source trees ----------------------------------------------------
     def tree_path(self, tree_hash: str) -> Path:
         return self.root / "trees" / f"{tree_hash}.tar.gz"
@@ -129,60 +230,10 @@ class ContentStore:
     ) -> dict:
         """Write a deterministic ``tar.gz`` of the files in ``tree``.
 
-        ``tree`` is the result of
-        :func:`tracking.provenance.tree_fingerprint` and supplies both the
-        key (``tree_hash``) and the member list. Member metadata is zeroed
-        and gzip's mtime pinned so the archive is byte-reproducible.
+        See :func:`write_tree_archive` for the archive format.
         """
-        root = Path(root)
         tree_hash = tree["tree_hash"]
         target = self.tree_path(tree_hash)
-        if target.is_file():
-            return {"path": f"trees/{tree_hash}.tar.gz", "sha256": hash_file(target)}
-
-        excluded_roots = tuple(DEFAULT_EXCLUDES) + tuple(excludes)
-        leaves = [
-            rel
-            for rel in tree.get("files", ())
-            if not _is_excluded(rel, excluded_roots)
-        ]
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".tmp-", suffix=".tar.gz")
-        os.close(fd)
-        try:
-            with open(tmp, "wb") as raw:
-                with gzip.GzipFile(
-                    fileobj=raw, mode="wb", mtime=0, filename=""
-                ) as gz:
-                    with tarfile.open(
-                        fileobj=gz, mode="w", format=tarfile.PAX_FORMAT
-                    ) as tar:
-                        for rel in sorted(leaves):
-                            path = root / rel
-                            if not path.is_file():
-                                continue
-                            info = tar.gettarinfo(str(path), arcname=rel)
-                            info.mtime = 0
-                            info.uid = info.gid = 0
-                            info.uname = info.gname = ""
-                            with open(path, "rb") as f:
-                                tar.addfile(info, f)
-            os.replace(tmp, target)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-
+        if not target.is_file():
+            write_tree_archive(root, tree, excludes, target)
         return {"path": f"trees/{tree_hash}.tar.gz", "sha256": hash_file(target)}
-
-
-def _is_excluded(rel: str, excluded_roots: Iterable[str]) -> bool:
-    parts = Path(rel).parts
-    for root in excluded_roots:
-        root_parts = Path(root).parts
-        if parts[: len(root_parts)] == root_parts:
-            return True
-    return False

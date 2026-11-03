@@ -16,6 +16,20 @@ class RunTracer(Protocol):
         """Append ``value`` to the list metric stored under ``key``."""
         ...
 
+    def add_artifact(
+        self,
+        name: str,
+        data: Any,
+        *,
+        media_type: str | None = None,
+        format: str | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
+
+    def add_array(
+        self, name: str, arrays: dict[str, Any], *, axes: Any = None
+    ) -> dict[str, Any]: ...
+
 
 class NullTracer:
     """No-op tracer used when observability is disabled."""
@@ -28,6 +42,12 @@ class NullTracer:
 
     def append_metric(self, key: str, value: Any) -> None:
         return None
+
+    def add_artifact(self, name: str, data: Any, **kwargs: Any) -> dict[str, Any]:
+        return {}
+
+    def add_array(self, name: str, arrays: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        return {}
 
 
 _current: contextvars.ContextVar[RunTracer | None] = contextvars.ContextVar(
@@ -71,6 +91,29 @@ def append_metric(key: str, value: Any) -> None:
         run.append_metric(key, value)
 
 
+def add_artifact(
+    name: str,
+    data: Any,
+    *,
+    media_type: str | None = None,
+    format: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Store ``data`` as an artifact of the active run, if any."""
+    run = _current.get()
+    if run is None:
+        return {}
+    return run.add_artifact(name, data, media_type=media_type, format=format, meta=meta)
+
+
+def add_array(name: str, arrays: dict[str, Any], *, axes: Any = None) -> dict[str, Any]:
+    """Store ``arrays`` as a ``.npz`` artifact of the active run, if any."""
+    run = _current.get()
+    if run is None:
+        return {}
+    return run.add_array(name, arrays, axes=axes)
+
+
 @contextmanager
 def measure(name: str) -> Iterator[None]:
     """Measure a block of code as ``<name>_time`` on the active run, if any."""
@@ -89,6 +132,7 @@ class _Capture:
 
     def __init__(self) -> None:
         self.metrics: dict[str, Any] = {}
+        self.artifacts: list[dict[str, Any]] = []
 
     def log_metric(self, key: str, value: Any) -> None:
         self.metrics[key] = value
@@ -98,6 +142,18 @@ class _Capture:
 
     def append_metric(self, key: str, value: Any) -> None:
         self.metrics.setdefault(key, []).append(value)
+
+    def add_artifact(self, name: str, data: Any, **kwargs: Any) -> dict[str, Any]:
+        # No project/store reference here (see module docstring): captured
+        # for the caller to inspect and re-add via the real active run,
+        # rather than silently dropped or written outside the caller's
+        # control.
+        record = {"name": name, "data": data, **kwargs}
+        self.artifacts.append(record)
+        return record
+
+    def add_array(self, name: str, arrays: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        return self.add_artifact(name, arrays, **kwargs)
 
 
 @contextmanager

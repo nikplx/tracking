@@ -25,7 +25,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from tracking.store import ContentStore, DEFAULT_EXCLUDES, hash_bytes, hash_file
+from tracking.store import DEFAULT_EXCLUDES, Store, hash_bytes, hash_file
 
 # Packages that can change numerical results and are therefore worth recording.
 DEFAULT_PACKAGES = ("tracking", "pythc", "numpy", "scipy", "pandas", "pymongo")
@@ -296,7 +296,7 @@ def env_fingerprint(packages: Iterable[str] | None = None) -> dict:
 
 def collect_inputs(
     paths: Iterable[str | Path],
-    store: ContentStore,
+    store: Store,
 ) -> list[dict]:
     """Hash and copy each input into the content-addressed store."""
     records: dict[tuple[str, str], dict] = {}

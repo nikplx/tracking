@@ -9,7 +9,7 @@ from tracking.provenance import (
     seed_deps,
     tree_fingerprint,
 )
-from tracking.store import ContentStore, hash_file
+from tracking.store import LocalStore, hash_file
 
 
 def _git(root, *args):
@@ -96,7 +96,7 @@ def test_deps_and_run_key_change_with_code_identity():
 
 
 def test_collect_inputs_copies_and_deduplicates(tmp_path):
-    store = ContentStore(tmp_path / "store")
+    store = LocalStore(tmp_path / "store")
     first = tmp_path / "in.txt"
     first.write_text("data", encoding="utf-8")
     second = tmp_path / "copy.txt"
