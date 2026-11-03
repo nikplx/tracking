@@ -20,11 +20,14 @@ import itertools
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Literal
 
 from pyinstrument import Profiler
 from tracking import observe
 from tracking.experiment import Backend, Experiment
+from tracking.provenance import seed_deps
+from tracking.project import FrozenProjectError, Project
 from tracking.resolve import Factory, Resolver
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,11 @@ class Sweep:
     grid: dict[str, list[Any]] = field(default_factory=dict)
     backend: Backend = "mongo_compact"
     collection: str | None = None
+    project: Project | None = None
+    deps: list[str] | None = None
+    inputs: list[str | Path] | None = None
+    rerun: Literal["missing", "stale", "always"] = "missing"
+    snapshot: bool = True
     checkpoint: bool = False
     profile: bool = False
     overwrite: bool = False
@@ -58,7 +66,6 @@ def expand_grid(grid: dict[str, list[Any]]) -> Iterator[dict[str, Any]]:
     for bundle in itertools.product(*values):
         yield dict(zip(keys, bundle))
 
-
 def execute(
     name: str,
     spec: dict[str, Any],
@@ -67,11 +74,16 @@ def execute(
     *,
     backend: Backend = "mongo_compact",
     collection: str | None = None,
+    project: Project | None = None,
+    deps: list[str] | None = None,
+    inputs: list[str | Path] | None = None,
+    rerun: Literal["missing", "stale", "always"] = "missing",
+    snapshot: bool = True,
     checkpoint: bool = False,
     profile: bool = False,
     overwrite: bool = False,
 ) -> None:
-    """Run one point unless a completed run with this exact spec exists.
+    """Run one point unless a completed run with this spec already exists.
 
     ``spec`` is the raw, pre-resolution config -- file paths, strings,
     numbers. Everything logged and hashed for dedup is plain data, never a
@@ -80,16 +92,46 @@ def execute(
     params.
     What gets built from ``spec``, and what it logs while running, is
     entirely the resolved entry object's business.
-    """
-    if not overwrite and Experiment.exists(spec, backend=backend, collection=collection):
-        logger.warning("run already exists for %s, skipping: %s", name, spec)
-        return
 
+    Provenance dependencies are the union of ``deps`` and the modules of
+    every registered factory, so a sweep records the code it actually
+    depends on without extra bookkeeping.
+    """
+    dep_specs = list(dict.fromkeys([*(deps or []), *seed_deps(factories)]))
     factory_spec = {**spec, **{f"{k}_factory": v.__name__ for k, v in factories.items()}}
 
-    with Experiment(name=name, params=factory_spec, backend=backend,
-                    checkpoints=checkpoint, collection=collection) as run:
-        runnable = Resolver(spec, factories).build(entry)
+    run = Experiment(
+        name=name,
+        params=factory_spec,
+        backend=backend,
+        checkpoints=checkpoint,
+        collection=collection,
+        project=project,
+        deps=dep_specs,
+        inputs=inputs,
+        snapshot=snapshot,
+    )
+
+    if not overwrite and rerun != "always":
+        if rerun == "missing":
+            skip = Experiment.exists(
+                spec, backend=backend, collection=collection,
+                project=project, rerun="missing",
+            )
+        else:  # "stale": compare the current computation identity
+            run.prepare()
+            skip = Experiment.exists(
+                spec, backend=backend, collection=collection,
+                project=project, rerun="stale", run_key=run.run_key,
+            )
+        if skip:
+            logger.warning("run already exists for %s, skipping: %s", name, spec)
+            return
+
+    with run:
+        resolver = Resolver(spec, factories)
+        runnable = resolver.build(entry)
+        run.set_graph(resolver.graph)
         observe.checkpoint("init_resolve")
 
         profiler_cm = Profiler() if profile else nullcontext()
@@ -103,6 +145,7 @@ def execute(
 
         observe.checkpoint("build_profile")
 
+
 def run_sweep(name: str, sweep: Sweep) -> None:
     """Run every point in ``bm``'s grid, one :class:`Experiment` each.
 
@@ -111,7 +154,8 @@ def run_sweep(name: str, sweep: Sweep) -> None:
     may be running unattended for hours on an HPC cluster. Call
     :func:`execute` directly instead of this function if you want a single
     point's exception to propagate (e.g. while developing a new
-    ``Runnable``).
+    ``Runnable``). A frozen project is the one exception: it aborts the
+    sweep instead of failing every point in turn.
     """
     for case in sweep.cases:
         for params in expand_grid(sweep.grid):
@@ -120,11 +164,15 @@ def run_sweep(name: str, sweep: Sweep) -> None:
                 execute(
                     name, spec, sweep.entry, sweep.factories,
                     backend=sweep.backend, collection=sweep.collection,
-                    checkpoint=sweep.checkpoint, profile=sweep.profile, overwrite=sweep.overwrite,
+                    project=sweep.project, deps=sweep.deps, inputs=sweep.inputs,
+                    rerun=sweep.rerun, snapshot=sweep.snapshot,
+                    checkpoint=sweep.checkpoint, profile=sweep.profile,
+                    overwrite=sweep.overwrite,
                 )
+            except FrozenProjectError:
+                raise
             except Exception:
                 logger.exception("run failed for %s, spec=%s; continuing sweep", name, spec)
-
 
 
 def setup_logger() -> logging.Logger:

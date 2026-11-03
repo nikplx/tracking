@@ -44,6 +44,16 @@ class Resolver:
         self.spec = spec
         self.factories = factories
         self._built: dict[str, Any] = {}
+        self._graph: dict[str, dict] = {}
+
+    @property
+    def graph(self) -> dict[str, dict]:
+        """Declared dependency graph: ``{key: {impl, deps}}``.
+
+        Only factory-built keys appear; literal ``spec`` entries are inputs,
+        not nodes. This is what travels into a run's provenance record.
+        """
+        return dict(self._graph)
 
     def build(self, key: str) -> Any:
         return self._build(key, stack=())
@@ -98,5 +108,10 @@ class Resolver:
             })
 
         obj = factory(**kwargs)
+        self._graph[key] = {
+            "impl": f"{getattr(factory, '__module__', '?')}:"
+            f"{getattr(factory, '__qualname__', repr(factory))}",
+            "deps": sorted(kwargs),
+        }
         self._built[key] = obj
         return obj

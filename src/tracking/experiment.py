@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Literal, Optional
@@ -18,7 +19,12 @@ import yaml
 from tracking._vendor import sacred
 from tracking._vendor.sacred.metrics_logger import linearize_metrics
 from tracking._vendor.sacred.observers.file_storage import FileStorageObserver
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from tracking import observe
 from tracking.hashing import (
@@ -27,12 +33,25 @@ from tracking.hashing import (
     spec_hash,
     to_bsonable,
 )
+from tracking.provenance import (
+    collect_inputs,
+    deps_digest,
+    env_fingerprint,
+    inputs_digest,
+    make_run_key,
+    resolve_dep,
+    tracking_version,
+    tree_fingerprint,
+)
+from tracking.project import FrozenProjectError, Project, default_project
 
 logger = logging.getLogger()
 
 type Backend = Literal["file", "mongo_compact"]
 
 MONGO_DB = os.environ.get("TRACKING_MONGO_DB", "tracking")
+SCHEMA_VERSION = 2
+PROVENANCE_SCHEMA_VERSION = 1
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
 SACRED_EXPERIMENT = "benchmark"
 
@@ -49,7 +68,7 @@ def _main():
 # MongoDB plumbing with retries for flaky HPC networks
 # ---------------------------------------------------------------------------
 
-_MONGO_CLIENT: Optional[pymongo.MongoClient] = None
+_MONGO_CLIENTS: dict[str, pymongo.MongoClient] = {}
 
 
 def get_mongo_url() -> str:
@@ -66,15 +85,34 @@ def _connect(url: str) -> pymongo.MongoClient:
     return client
 
 
-def get_mongo_client() -> pymongo.MongoClient:
-    global _MONGO_CLIENT
-    if _MONGO_CLIENT is None:
-        _MONGO_CLIENT = _connect(get_mongo_url())
-    return _MONGO_CLIENT
+def get_mongo_client(uri: str | None = None) -> pymongo.MongoClient:
+    """Return a cached client for ``uri`` (or the environment's URL).
+
+    One client per URL, so projects that share a cluster share a connection
+    pool while projects on different clusters do not collide.
+    """
+    url = uri or get_mongo_url()
+    client = _MONGO_CLIENTS.get(url)
+    if client is None:
+        client = _connect(url)
+        _MONGO_CLIENTS[url] = client
+    return client
 
 
-def get_runs_collection(collection: str):
-    return get_mongo_client()[MONGO_DB][collection or "runs"]
+def get_runs_collection(
+    collection: str,
+    db: str | None = None,
+    project: Project | None = None,
+):
+    """Resolve a collection, optionally overriding the database.
+
+    Kept as a module-level function (rather than a ``Project`` method) so the
+    existing notebooks and tests that monkeypatch it keep working.
+    """
+    project = project or default_project()
+    if db is not None and db != project.db:
+        project = replace(project, db=db)
+    return project.collection(collection)
 
 
 def _jsonl_path(file_path=None) -> Path:
@@ -106,6 +144,10 @@ class Experiment:
         backend: Backend = "mongo_compact",
         checkpoints: bool = True,
         collection: Optional[str] = None,
+        project: Optional[Project] = None,
+        deps: Optional[list[str]] = None,
+        inputs: Optional[list[str | Path]] = None,
+        snapshot: bool = True,
     ):
         self.name = name
         self.params = params
@@ -116,6 +158,11 @@ class Experiment:
         self.backend = backend
         self.checkpoint_enabled = checkpoints
         self.collection = collection or "runs"
+        self._project = project
+        self.deps = list(deps or [])
+        self.inputs = list(inputs or [])
+        self.snapshot = snapshot
+        self.tier = "draft"
         self.timestamp: Optional[datetime] = None
         self.duration = 0.0
         self.metrics: Dict[str, Any] = {}
@@ -123,6 +170,112 @@ class Experiment:
         self._sacred_run = None
         self._observe_token = None
         self._scalar_steps: Dict[str, int] = {}
+        self._provenance: Optional[dict] = None
+        self._run_key: Optional[str] = None
+        self._tree: Optional[dict] = None
+        self._provenance_root = Path.cwd()
+
+    # -- project / provenance helpers ------------------------------------
+    @property
+    def project(self) -> Project:
+        return self._project or default_project()
+
+    @property
+    def run_key(self) -> Optional[str]:
+        """Identity of this computation; available after :meth:`prepare`."""
+        return self._run_key
+
+    def _collection(self):
+        """Resolve the target collection.
+
+        The no-project path calls the module-level helper with the same
+        single argument it always took, so monkeypatching
+        ``tracking.experiment.get_runs_collection`` keeps working.
+        """
+        if self._project is None:
+            return get_runs_collection(self.collection)
+        return get_runs_collection(self.collection, project=self._project)
+
+    def _tree_excludes(self) -> tuple[str, ...]:
+        excludes = tuple(self.project.tree_excludes)
+        try:
+            store_rel = self.project.store.root.resolve().relative_to(self._provenance_root)
+            excludes += (store_rel.as_posix(),)
+        except ValueError:
+            pass
+        return excludes
+
+    def prepare(self) -> None:
+        """Capture provenance and the run key without starting the run.
+
+        Idempotent. Called by ``__enter__`` and by the driver before its
+        dedup check, so ``rerun="stale"`` can compare the *current*
+        computation identity against stored ones without duplicating work.
+        """
+        if self._provenance is not None:
+            return
+        self._provenance = self._capture_provenance()
+        self._run_key = make_run_key(
+            spec_hash(self.params),
+            self._provenance["code"]["deps_hash"],
+            self._provenance["inputs_hash"],
+        )
+
+    def _capture_provenance(self) -> dict:
+        tree = tree_fingerprint(self._provenance_root, excludes=self._tree_excludes())
+        self._tree = tree
+        deps = sorted((resolve_dep(d) for d in self.deps), key=lambda d: d["name"])
+        inputs = collect_inputs(self.inputs, self.project.store)
+        env = env_fingerprint()
+        return {
+            "schema_version": PROVENANCE_SCHEMA_VERSION,
+            "code": {
+                "git": {k: tree[k] for k in ("commit", "branch", "dirty", "tag")},
+                "tree_hash": tree["tree_hash"],
+                "deps": deps,
+                "deps_hash": deps_digest(deps),
+                "snapshot": None,
+                "graph": {},
+            },
+            "env": env,
+            "inputs": inputs,
+            "inputs_hash": inputs_digest(inputs),
+            "verified": True,
+        }
+
+    def set_graph(self, graph: dict) -> None:
+        """Attach the declared computation graph (from :class:`Resolver`)."""
+        if self._provenance is not None:
+            self._provenance["code"]["graph"] = graph
+
+    def _snapshot_source_tree(self, success: bool) -> None:
+        """Capture a source tarball on success.
+
+        Archiving must never fail a long calculation: on error we log, leave
+        ``snapshot`` as ``None`` and let promotion decide what to do with the
+        unverified run.
+        """
+        if not success or not self.snapshot:
+            return
+        if self._provenance is None or self._tree is None:
+            return
+        try:
+            self._provenance["code"]["snapshot"] = self.project.store.put_tree(
+                self._provenance_root,
+                self._tree,
+                excludes=self._tree_excludes(),
+            )
+        except Exception:
+            logger.warning("could not snapshot source tree", exc_info=True)
+
+    def _run_fields(self) -> dict:
+        return {
+            "run_key": self._run_key,
+            "tier": self.tier,
+            "invalidated": None,
+            "promoted_at": None,
+            "provenance": self._provenance,
+        }
 
     # -- active-run plumbing (keeps ``benchmark.py`` metric isolation working)
     @staticmethod
@@ -202,6 +355,8 @@ class Experiment:
         config = _cleaned(self.params)
         logger.info("running experiment with config:\n" + yaml.dump(config))
 
+        self.prepare()
+
         if self.backend == "mongo_compact":
             self._observe_token = observe.set_active(self)
             self._compact_upsert(status="RUNNING")
@@ -261,6 +416,8 @@ class Experiment:
         else:
             self.metrics["status"] = "SUCCESS"
 
+        self._snapshot_source_tree(success=exc_type is None)
+
         if self.backend == "mongo_compact":
             self._compact_upsert(
                 status="FAILED" if exc_type else "COMPLETED")
@@ -307,26 +464,46 @@ class Experiment:
         params: Dict[str, Any],
         backend: Backend = "mongo_compact",
         collection: Optional[str] = None,
+        project: Optional[Project] = None,
+        rerun: Literal["missing", "stale", "always"] = "missing",
+        run_key: Optional[str] = None,
     ) -> bool:
-        """Skip check: is there a completed run with these dimensions?
+        """Skip check: has this computation already completed?
 
-        Compares a single :func:`spec_hash` over the cleaned dimensions
-        instead of one equality clause per key. Runs written before the
-        hash existed have no ``spec_hash`` and never match (they re-run
-        once, then carry the hash going forward).
+        ``rerun="missing"`` (default) matches any completed run with the same
+        dimensions, so a code change never triggers recomputation.
+        ``rerun="stale"`` additionally requires the *current* computation
+        identity (``run_key``) to match, so changed code or inputs do re-run.
+        ``rerun="always"`` never skips.
+
+        The file backend has no run-key index; ``"stale"`` degrades to
+        ``"missing"`` there.
         """
+        if rerun == "always":
+            return False
+        if rerun not in ("missing", "stale"):
+            raise ValueError(f"unknown rerun policy: {rerun!r}")
+
         h = spec_hash(params)
         if backend == "mongo_compact":
-            coll = get_runs_collection(collection or "runs")
+            coll = (
+                get_runs_collection(collection or "runs")
+                if project is None
+                else get_runs_collection(collection or "runs", project=project)
+            )
             try:
-                coll.create_index([("spec_hash", 1), ("status", 1)])
+                coll.create_index([("spec_hash", 1), ("run_key", 1), ("status", 1)])
             except Exception:
                 logger.debug("could not create spec_hash index", exc_info=True)
-            return coll.find_one(
-                {"spec_hash": h, "status": "COMPLETED"},
-                {"_id": 1},
-            ) is not None
+            query: dict[str, Any] = {"spec_hash": h, "status": "COMPLETED"}
+            if rerun == "stale":
+                if run_key is None:
+                    raise ValueError("rerun='stale' requires a run_key")
+                query["run_key"] = run_key
+            return coll.find_one(query, {"_id": 1}) is not None
         elif backend == "file":
+            if rerun == "stale":
+                logger.debug("file backend has no run-key index; treating 'stale' as 'missing'")
             return h in _successful_file_hashes(_jsonl_path())
         else:
             raise ValueError(f"unknown backend: {backend!r}")
@@ -334,8 +511,13 @@ class Experiment:
     # -- compact mongo backend: one self-contained doc per run -----------
     def _compact_doc(self, status: str) -> Dict[str, Any]:
         """Same shape as a :meth:`_save_to_jsonl` row, plus query helpers."""
-        return {
-            "meta": {"run_name": self.name, "timestamp": str(self.timestamp)},
+        doc = {
+            "meta": {
+                "run_name": self.name,
+                "timestamp": str(self.timestamp),
+                "tracking_version": tracking_version(),
+                "schema_version": SCHEMA_VERSION,
+            },
             "spec_hash": spec_hash(self.params),
             "dimensions": _cleaned(self.params),
             "metrics": {k: to_bsonable(v) for k, v in self.metrics.items()},
@@ -346,26 +528,46 @@ class Experiment:
             "status": status,
             "updated": datetime.now(timezone.utc),
         }
+        doc.update(self._run_fields())
+        return doc
 
-    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, max=30))
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, max=30),
+        retry=retry_if_not_exception_type(FrozenProjectError),
+    )
     def _compact_upsert(self, status: str | None = None) -> None:
-        """Insert-or-replace this run's doc, keyed by ``spec_hash``.
+        """Insert-or-replace this run's doc, keyed by ``spec_hash`` + ``run_key``.
 
-        Persists on entry (``RUNNING``), every :meth:`checkpoint`, and exit
-        (``COMPLETED``/``FAILED``) — the same phase boundaries at which the
-        file backend flushes, so long HPC runs leave resumable state.
+        The pair matters: re-running the *same* computation (same dimensions,
+        code and inputs) replaces its own document, while re-running after a
+        code or input change inserts alongside the previous result instead of
+        destroying it. Persists on entry (``RUNNING``), every
+        :meth:`checkpoint`, and exit (``COMPLETED``/``FAILED``).
         """
+        if self._project is not None:
+            self._project.assert_writable()
         st = status or self.metrics.get("status") or "RUNNING"
         doc = self._compact_doc(st)
         doc["metrics"]["status"] = self.metrics.get("status", st)
-        coll = get_runs_collection(self.collection)
-        coll.replace_one({"spec_hash": doc["spec_hash"]}, doc, upsert=True)
+        coll = self._collection()
+        flt = {"spec_hash": doc["spec_hash"]}
+        if doc.get("run_key"):
+            flt["run_key"] = doc["run_key"]
+        coll.replace_one(flt, doc, upsert=True)
 
     # -- file backend ----------------------------------------------------
     def _save_to_jsonl(self, file_path=None) -> None:
+        if self._project is not None:
+            self._project.assert_writable()
         file_path = _jsonl_path(file_path)
         row = {
-            "meta": {"run_name": self.name, "timestamp": str(self.timestamp)},
+            "meta": {
+                "run_name": self.name,
+                "timestamp": str(self.timestamp),
+                "tracking_version": tracking_version(),
+                "schema_version": SCHEMA_VERSION,
+            },
             "spec_hash": spec_hash(self.params),
             "dimensions": _cleaned(self.params),
             "metrics": {k: to_bsonable(v) for k, v in self.metrics.items()},
@@ -374,6 +576,7 @@ class Experiment:
                 for c in self.checkpoint_log
             ],
         }
+        row.update(self._run_fields())
         with open(file_path, mode="a", encoding="utf-8") as f:
             f.write(json.dumps(row, default=str) + "\n")
         logger.info("Run %s saved to JSONL (%s)", self.name, file_path)
@@ -419,5 +622,30 @@ def normalize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
                 flat[f"{prefix}_{k}"] = v
         if "checkpoints" in doc:
             flat["checkpoints"] = doc["checkpoints"]
+        if "spec_hash" in doc:
+            flat["spec_hash"] = doc["spec_hash"]
+        if "run_key" in doc:
+            flat["run_key"] = doc["run_key"]
+        if "tier" in doc:
+            flat["tier"] = doc["tier"]
+
+        invalidated = doc.get("invalidated")
+        flat["invalidated"] = bool(invalidated)
+        if isinstance(invalidated, dict):
+            flat["invalidated_at"] = invalidated.get("at")
+            flat["invalidated_reason"] = invalidated.get("reason")
+
+        provenance = doc.get("provenance") or {}
+        if provenance:
+            code = provenance.get("code") or {}
+            git = code.get("git") or {}
+            flat["provenance_schema_version"] = provenance.get("schema_version")
+            flat["provenance_verified"] = provenance.get("verified")
+            flat["provenance_code_git_commit"] = git.get("commit")
+            flat["provenance_code_git_dirty"] = git.get("dirty")
+            flat["provenance_code_tree_hash"] = code.get("tree_hash")
+            flat["provenance_code_deps_hash"] = code.get("deps_hash")
+            flat["provenance_env_hash"] = (provenance.get("env") or {}).get("hash")
+            flat["provenance_inputs_hash"] = provenance.get("inputs_hash")
     return flat
 
