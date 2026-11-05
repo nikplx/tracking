@@ -11,8 +11,13 @@ same protocol against an S3-compatible bucket.
 
 Local layout::
 
-    <root>/objects/<sha[:2]>/<sha>      # arbitrary blobs (inputs, artifacts)
-    <root>/trees/<tree_hash>.tar.gz     # source-tree snapshots, keyed by tree hash
+    <root>/objects/<sha[:2]>/<sha><ext>  # arbitrary blobs (inputs, artifacts)
+    <root>/trees/<tree_hash>.tar.gz      # source-tree snapshots, keyed by tree hash
+
+Objects keep the extension of the file they came from (``.npz``, ``.html``,
+``.txt``, ...) so a local store is browsable and materialized artifacts open
+with the right application. The hash remains the identity; the extension is
+only a human-friendly hint and is discovered automatically when reading.
 
 Pure stdlib: :mod:`tarfile` and :mod:`gzip`, no extra dependencies.
 """
@@ -77,6 +82,18 @@ def hash_file(path: Path | str) -> str:
     return digest
 
 
+def normalize_suffix(suffix: str | None) -> str:
+    """Return ``suffix`` as a safe ``.ext`` string (``""`` when absent)."""
+    if not suffix:
+        return ""
+    text = str(suffix).strip()
+    if not text:
+        return ""
+    if "/" in text or "\\" in text or text in (".", ".."):
+        raise ValueError(f"invalid object suffix {suffix!r}")
+    return text if text.startswith(".") else f".{text}"
+
+
 # ---------------------------------------------------------------------------
 # Store protocol
 # ---------------------------------------------------------------------------
@@ -86,15 +103,21 @@ class Store(Protocol):
     """A content-addressed blob store: local disk, S3, or anything else."""
 
     def has(self, sha: str) -> bool: ...
-    def put_bytes(self, data: bytes) -> str: ...
-    def put_file(self, path: Path | str) -> str: ...
+    def put_bytes(self, data: bytes, *, suffix: str = "") -> str: ...
+    def put_file(self, path: Path | str, *, suffix: str | None = None) -> str: ...
     def get_bytes(self, sha: str) -> bytes: ...
-    def get_file(self, sha: str, dest: Path | str | None = None) -> Path:
+    def get_file(
+        self, sha: str, dest: Path | str | None = None, *, suffix: str = ""
+    ) -> Path:
         """Materialize object ``sha`` as a real file and return its path."""
         ...
 
-    def uri(self, sha: str) -> str:
+    def uri(self, sha: str, *, suffix: str = "") -> str:
         """A stable locator for object ``sha`` (``file://...``, ``s3://...``)."""
+        ...
+
+    def object_key(self, sha: str, *, suffix: str = "") -> str:
+        """Object key relative to the store root (for portable references)."""
         ...
 
     def has_tree(self, tree_hash: str) -> bool: ...
@@ -172,16 +195,27 @@ class LocalStore:
         self.root = Path(root)
 
     # -- objects ---------------------------------------------------------
-    def object_path(self, sha: str) -> Path:
-        return self.root / "objects" / sha[:2] / sha
+    def object_path(self, sha: str, suffix: str | None = None) -> Path:
+        """Path of object ``sha``.
+
+        With ``suffix=None`` the already-stored object is discovered,
+        preferring an exact hash-only name (objects written by older
+        versions) and otherwise the first ``<sha>.<ext>`` file. Pass a
+        suffix explicitly to address a path before it exists.
+        """
+        parent = self.root / "objects" / sha[:2]
+        if suffix is not None:
+            return parent / f"{sha}{normalize_suffix(suffix)}"
+        extended = sorted(p for p in parent.glob(f"{sha}.*") if p.is_file())
+        return extended[0] if extended else parent / sha
 
     def has(self, sha: str) -> bool:
         return self.object_path(sha).is_file()
 
-    def put_bytes(self, data: bytes) -> str:
+    def put_bytes(self, data: bytes, *, suffix: str = "") -> str:
         sha = hash_bytes(data)
-        target = self.object_path(sha)
-        if target.is_file():
+        target = self.object_path(sha, suffix)
+        if self.has(sha) or target.is_file():
             return sha
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".tmp-")
@@ -197,14 +231,23 @@ class LocalStore:
             raise
         return sha
 
-    def put_file(self, path: Path | str) -> str:
-        return self.put_bytes(Path(path).read_bytes())
+    def put_file(self, path: Path | str, *, suffix: str | None = None) -> str:
+        path = Path(path)
+        if suffix is None:
+            suffix = path.suffix
+        return self.put_bytes(path.read_bytes(), suffix=suffix)
 
     def get_bytes(self, sha: str) -> bytes:
         return self.object_path(sha).read_bytes()
 
-    def get_file(self, sha: str, dest: Path | str | None = None) -> Path:
+    def get_file(
+        self, sha: str, dest: Path | str | None = None, *, suffix: str = ""
+    ) -> Path:
         source = self.object_path(sha)
+        if not source.is_file() and suffix:
+            candidate = self.object_path(sha, suffix)
+            if candidate.is_file():
+                source = candidate
         if dest is None:
             return source
         dest = Path(dest)
@@ -212,8 +255,20 @@ class LocalStore:
         shutil.copyfile(source, dest)
         return dest
 
-    def uri(self, sha: str) -> str:
-        return self.object_path(sha).resolve().as_uri()
+    def uri(self, sha: str, *, suffix: str = "") -> str:
+        return self._object_file(sha, suffix).resolve().as_uri()
+
+    def object_key(self, sha: str, *, suffix: str = "") -> str:
+        """``objects/<2>/<sha><ext>``, relative to this store's root."""
+        return self._object_file(sha, suffix).relative_to(self.root).as_posix()
+
+    def _object_file(self, sha: str, suffix: str = "") -> Path:
+        path = self.object_path(sha)
+        if not path.is_file() and suffix:
+            candidate = self.object_path(sha, suffix)
+            if candidate.is_file():
+                path = candidate
+        return path
 
     # -- source trees ----------------------------------------------------
     def tree_path(self, tree_hash: str) -> Path:

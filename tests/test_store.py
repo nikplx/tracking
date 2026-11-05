@@ -24,6 +24,32 @@ def test_local_store_uri_is_a_file_uri(tmp_path):
     uri = store.uri(sha)
     assert uri.startswith("file://")
     assert uri.endswith(f"/{sha[:2]}/{sha}")
+    assert store.object_key(sha) == f"objects/{sha[:2]}/{sha}"
+
+
+def test_local_store_keeps_file_extension(tmp_path):
+    store = LocalStore(tmp_path / "store")
+    sha = store.put_bytes(b"npz-bytes", suffix="npz")
+
+    path = store.get_file(sha)
+    assert path.name == f"{sha}.npz"
+    assert path.read_bytes() == b"npz-bytes"
+    assert store.get_bytes(sha) == b"npz-bytes"
+    assert store.uri(sha).endswith(f"/{sha[:2]}/{sha}.npz")
+    assert store.object_key(sha) == f"objects/{sha[:2]}/{sha}.npz"
+
+    # Older hash-only objects still resolve.
+    legacy = store.put_bytes(b"legacy")
+    assert store.get_file(legacy).name == legacy
+
+
+def test_local_store_put_file_uses_source_extension(tmp_path):
+    store = LocalStore(tmp_path / "store")
+    source = tmp_path / "input.txt"
+    source.write_text("input", encoding="utf-8")
+
+    sha = store.put_file(source)
+    assert store.get_file(sha).name == f"{sha}.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -77,10 +103,25 @@ def test_s3_store_roundtrip_and_dedup(tmp_path, monkeypatch):
     assert client.put_calls == 1
 
     assert store.uri(sha) == f"s3://bucket/proj/objects/{sha[:2]}/{sha}"
+    assert store.object_key(sha) == f"objects/{sha[:2]}/{sha}"
 
     dest = tmp_path / "materialized.bin"
     assert store.get_file(sha, dest) == dest
     assert dest.read_bytes() == b"hello"
+
+
+def test_s3_store_keeps_suffix(tmp_path, monkeypatch):
+    import tracking.store_s3 as store_s3
+
+    monkeypatch.setattr(store_s3, "ClientError", _NotFound)
+    client = _FakeS3Client()
+    store = S3Store("bucket", prefix="proj", client=client, cache_dir=tmp_path / "cache")
+
+    sha = store.put_bytes(b"npz", suffix="npz")
+    assert store.get_bytes(sha) == b"npz"
+    assert store.uri(sha).endswith(f"/{sha[:2]}/{sha}.npz")
+    assert store.object_key(sha) == f"objects/{sha[:2]}/{sha}.npz"
+    assert store.get_file(sha).name == f"{sha}.npz"
 
 
 def test_s3_store_put_tree_matches_local_archive(tmp_path, monkeypatch):

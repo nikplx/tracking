@@ -89,7 +89,7 @@ Inside the `with` block, `observe.log_metric`/`observe.checkpoint`/`observe.meas
 
 ### Storing large results: artifacts
 
-Matrices, Wannier90 files, profiler reports — anything too big or too binary for a Mongo document — go through `add_artifact`/`add_array` instead of `log_metric`. The bytes are written to the project's content-addressed store (see [Backends and storage](#backends-and-storage)); only a small descriptor (`name`, `sha256`, `size`, `uri`, ...) is embedded in the run document:
+Matrices, Wannier90 files, profiler reports — anything too big or too binary for a Mongo document — go through `add_artifact`/`add_array` instead of `log_metric`. The bytes are written to the project's content-addressed store (see [Backends and storage](#backends-and-storage)); only a small descriptor (`name`, `filename`, `sha256`, `size`, `object`, ...) is embedded in the run document. `object` is relative to the store root (for example `objects/ab/<sha>.npz`), so a copied or shipped store needs no path rewriting:
 
 ```python
 run.add_array("density_matrix", {"dm": factors.density_matrix}, axes="ao,ao")
@@ -199,10 +199,27 @@ python sweep.py                        # run everything
 
 ### Backends and storage
 
-`backend="mongo_compact"` (the only backend, and the default) writes **one self-contained document per run** to MongoDB, keyed by `spec_hash`. The document holds `meta`, `dimensions`, `metrics`, `checkpoints`, `artifacts`, `provenance`, `status` (`RUNNING`/`COMPLETED`/`FAILED`) and `updated`. It is written on entry, at every `observe.checkpoint`, and on exit, with retrying writes so a flaky HPC network does not lose progress. Connection settings:
+`backend="mongo_compact"` (the default) writes **one self-contained document per run** to MongoDB, keyed by `spec_hash`. `backend="file"` writes the same document as a local JSON file instead — no MongoDB needed — under `TRACKING_FILE_ROOT` (default `DATA_DIR/runs`)::
 
-* `MONGODB_URL` or `MONGO_URL` — connection string (required; a clear error is raised if neither is set)
+    <file_root>/<collection>/<run_key>.json
+
+The file backend is atomic and checkpoint-aware just like Mongo (a `.json` file is replaced on entry, at every `observe.checkpoint`, and on exit), and `Project.load`/`status`/`artifacts` work unchanged when the `Project` is created with `backend="file"`:
+
+```python
+from tracking import Experiment, Project, load_file_data
+
+project = Project("paper", backend="file", file_root="runs")
+with Experiment("solver", {"tol": 1e-8}, backend="file", project=project) as run:
+    run.log_metric("iterations", 12)
+
+df = load_file_data(project, collection="runs")   # or project.load("runs")
+```
+
+The document holds `meta`, `dimensions`, `metrics`, `checkpoints`, `artifacts`, `provenance`, `status` (`RUNNING`/`COMPLETED`/`FAILED`) and `updated`. The Mongo backend is written on entry, at every `observe.checkpoint`, and on exit, with retrying writes so a flaky HPC network does not lose progress. Connection settings:
+
+* `MONGODB_URL` or `MONGO_URL` — connection string (required for the Mongo backend; a clear error is raised if neither is set)
 * `TRACKING_MONGO_DB` — database name (default `tracking`), or `TRACKING_PROJECT` to select a `Project` by name
+* `TRACKING_FILE_ROOT` — root directory for `backend="file"` (default `DATA_DIR/runs`)
 * `collection=` on `Experiment`/`Sweep` — collection name (default `runs`)
 
 Older collections written by the historical Sacred-document and `backend="mongodb"` schemas are still readable through `normalize_doc` / `load_mongo_data`.
@@ -212,7 +229,7 @@ Artifacts, input files and source-tree snapshots go through a separate, content-
 * a plain path (or `DATA_DIR/tracking_store` by default) — backed by `tracking.store.LocalStore`, good enough on a shared HPC filesystem;
 * an `s3://bucket/prefix` URI — backed by `tracking.store_s3.S3Store` against any S3-compatible endpoint (AWS, MinIO, Ceph). Requires the `tracking[s3]` extra (`pip install tracking[s3]`), which pulls in `boto3`.
 
-Both implement the same protocol (`tracking.store.Store`), so nothing else in the package — or your own code reading `Project.store`/`Project.load_artifact` — needs to know which one is in use.
+Both implement the same protocol (`tracking.store.Store`), so nothing else in the package — or your own code reading `Project.store`/`Project.load_artifact` — needs to know which one is in use. Local objects keep the source extension (`objects/ab/<sha>.npz`, `objects/cd/<sha>.html`, ...), while the hash remains the identity, so the store is browsable and materialized artifacts open with the right application.
 
 ### Reading results back
 
@@ -229,7 +246,18 @@ mongo_df = load_mongo_data(
 mongo_df.groupby("dimensions_tolerance")["metrics_iterations"].mean()
 ```
 
-`get_runs_collection(name)` uses the same `MONGODB_URL`/`MONGO_URL` and `TRACKING_MONGO_DB` settings as the compact backend. `load_mongo_data(collection, query)` needs an explicit query. `Project.status(collection)` additionally computes a `validity` column (`CURRENT`/`STALE_CODE`/`STALE_ENV`/`STALE_INPUT`/`INVALIDATED`/`UNKNOWN`) by re-checking each run's recorded provenance against the current code and inputs. `load_json_data(path)` remains available as a generic JSONL loader for externally produced files, skipping a half-written final line from a live writer.
+`get_runs_collection(name)` uses the same `MONGODB_URL`/`MONGO_URL` and `TRACKING_MONGO_DB` settings as the compact backend. `load_mongo_data(collection, query)` needs an explicit query. For local files, `load_file_data(project, collection="runs", query=...)` returns the same normalized DataFrame shape. `Project.status(collection)` additionally computes a `validity` column (`CURRENT`/`STALE_CODE`/`STALE_ENV`/`STALE_INPUT`/`INVALIDATED`/`UNKNOWN`) by re-checking each run's recorded provenance against the current code and inputs. `load_json_data(path)` remains available as a generic JSONL loader for externally produced files, skipping a half-written final line from a live writer.
+
+Artifacts are just as easy to get at. `Project.load_artifacts(collection, query=...)` returns one row per artifact with its descriptor fields plus a `filename` and a ready-to-open local `path`; pass `dest="export/"` to materialize copies with their proper endings. No hashes to wrangle:
+
+```python
+artifacts = project.load_artifacts("solver_sweep_v1")
+artifacts[["name", "filename", "path"]]
+
+# or from tracking import load_artifacts
+array_path = project.load_artifacts("solver_sweep_v1", dest="artifacts").at[0, "path"]
+```
+
 
 ### Comparing runs against a baseline
 

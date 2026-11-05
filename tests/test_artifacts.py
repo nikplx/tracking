@@ -75,6 +75,19 @@ def test_add_artifact_round_trips_bytes(tmp_path):
     assert dest.read_bytes() == b"hello world"
 
 
+def test_artifact_descriptor_uses_store_relative_object(tmp_path):
+    project, _ = _project(tmp_path)
+    descriptor = _run(
+        project, tmp_path,
+        lambda run: run.add_array("density", {"dm": np.eye(2)}),
+    )
+
+    sha = descriptor["sha256"]
+    assert descriptor["object"] == f"objects/{sha[:2]}/{sha}.npz"
+    assert "uri" not in descriptor
+    assert not descriptor["object"].startswith("/")
+
+
 def test_add_array_round_trips_arrays(tmp_path):
     project, _ = _project(tmp_path)
     arrays = {"dm": np.eye(3), "energies": np.array([1.0, 2.0, 3.0])}

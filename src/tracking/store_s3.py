@@ -21,7 +21,7 @@ import boto3
 from botocore.exceptions import ClientError
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from tracking.store import hash_bytes, hash_file, write_tree_archive
+from tracking.store import hash_bytes, hash_file, normalize_suffix, write_tree_archive
 
 _RETRY = dict(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, max=30))
 
@@ -50,6 +50,10 @@ class S3Store:
             if cache_dir is not None
             else Path(tempfile.gettempdir()) / "tracking_s3_cache"
         )
+        # sha -> key, so a suffixed object written in this process can be
+        # found again without a bucket listing. Real buckets additionally
+        # support discovery via ``list_objects_v2`` below.
+        self._known: dict[str, str] = {}
 
     @property
     def client(self):
@@ -61,8 +65,36 @@ class S3Store:
     def _key(self, *parts: str) -> str:
         return "/".join(p for p in (self.prefix, *parts) if p)
 
-    def _object_key(self, sha: str) -> str:
-        return self._key("objects", sha[:2], sha)
+    def _object_key(self, sha: str, suffix: str = "") -> str:
+        return self._key("objects", sha[:2], f"{sha}{normalize_suffix(suffix)}")
+
+    def _find_object_key(self, sha: str, suffix: str = "") -> str:
+        """Locate ``sha`` in the bucket, discovering its stored extension."""
+        if suffix:
+            return self._object_key(sha, suffix)
+        known = self._known.get(sha)
+        if known is not None:
+            return known
+        base = self._object_key(sha)
+        if self._head(base):
+            self._known[sha] = base
+            return base
+        lister = getattr(self.client, "list_objects_v2", None)
+        if lister is not None:
+            try:
+                prefix = self._key("objects", sha[:2], sha)
+                response = lister(Bucket=self.bucket, Prefix=prefix)
+                keys = sorted(
+                    item["Key"]
+                    for item in response.get("Contents", ())
+                    if item["Key"] == prefix or item["Key"].startswith(f"{prefix}.")
+                )
+                if keys:
+                    self._known[sha] = keys[0]
+                    return keys[0]
+            except Exception:
+                pass
+        return base
 
     def _tree_key(self, tree_hash: str) -> str:
         return self._key("trees", f"{tree_hash}.tar.gz")
@@ -97,21 +129,29 @@ class S3Store:
 
     # -- objects -------------------------------------------------------------
     def has(self, sha: str) -> bool:
-        return self._head(self._object_key(sha))
+        return self._head(self._find_object_key(sha))
 
-    def put_bytes(self, data: bytes) -> str:
+    def put_bytes(self, data: bytes, *, suffix: str = "") -> str:
         sha = hash_bytes(data)
-        key = self._object_key(sha)
-        if not self._head(key):
+        existing = self._find_object_key(sha)
+        if self._head(existing):
+            self._known[sha] = existing
+            key = existing
+        else:
+            key = self._object_key(sha, suffix)
             self._put_object(key, data)
+            self._known[sha] = key
         self._write_cache(key, data)
         return sha
 
-    def put_file(self, path: Path | str) -> str:
-        return self.put_bytes(Path(path).read_bytes())
+    def put_file(self, path: Path | str, *, suffix: str | None = None) -> str:
+        path = Path(path)
+        if suffix is None:
+            suffix = path.suffix
+        return self.put_bytes(path.read_bytes(), suffix=suffix)
 
     def get_bytes(self, sha: str) -> bytes:
-        key = self._object_key(sha)
+        key = self._find_object_key(sha)
         cached = self._cache_path(key)
         if cached.is_file():
             return cached.read_bytes()
@@ -119,9 +159,14 @@ class S3Store:
         self._write_cache(key, data)
         return data
 
-    def get_file(self, sha: str, dest: Path | str | None = None) -> Path:
-        self.get_bytes(sha)  # ensures the cache is populated
-        cached = self._cache_path(self._object_key(sha))
+    def get_file(
+        self, sha: str, dest: Path | str | None = None, *, suffix: str = ""
+    ) -> Path:
+        key = self._find_object_key(sha, suffix)
+        cached = self._cache_path(key)
+        if not cached.is_file():
+            data = self._get_object(key)
+            self._write_cache(key, data)
         if dest is None:
             return cached
         dest = Path(dest)
@@ -129,8 +174,14 @@ class S3Store:
         dest.write_bytes(cached.read_bytes())
         return dest
 
-    def uri(self, sha: str) -> str:
-        return f"s3://{self.bucket}/{self._object_key(sha)}"
+    def uri(self, sha: str, *, suffix: str = "") -> str:
+        return f"s3://{self.bucket}/{self._find_object_key(sha, suffix)}"
+
+    def object_key(self, sha: str, *, suffix: str = "") -> str:
+        """``objects/<2>/<sha><ext>``, relative to this store's prefix."""
+        key = self._find_object_key(sha, suffix)
+        prefix = f"{self.prefix}/" if self.prefix else ""
+        return key[len(prefix) :] if prefix and key.startswith(prefix) else key
 
     # -- source trees ----------------------------------------------------
     def has_tree(self, tree_hash: str) -> bool:

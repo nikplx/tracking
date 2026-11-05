@@ -7,7 +7,7 @@ from tracking.project import FrozenProjectError, Project, default_project
 from tracking.driver import Sweep, execute, run, run_sweep
 from tracking.resolve import Resolver, ResolutionError
 from tracking.runnable import Runnable
-from tracking.load import load_json_data, load_mongo_data
+from tracking.load import load_artifacts, load_file_data, load_json_data, load_mongo_data
 
 __all__ = [
     "Sweep",
@@ -21,6 +21,8 @@ __all__ = [
     "add_reference_diffs",
     "default_project",
     "execute",
+    "load_artifacts",
+    "load_file_data",
     "load_json_data",
     "load_mongo_data",
     "normalize_doc",

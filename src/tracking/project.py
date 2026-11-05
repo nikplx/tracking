@@ -1,8 +1,8 @@
-"""Projects: one MongoDB database per paper/investigation.
+"""Projects: one paper/investigation, backed by Mongo or local JSON files.
 
 A :class:`Project` fixes three things that used to be ambient process state:
 
-* which database the runs live in (collections are sweeps within it),
+* which database/run-file tree the runs live in (collections are sweeps),
 * which content-addressed store backs provenance, and
 * whether the project is frozen and must reject new writes.
 
@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from tracking.provenance import env_fingerprint, resolve_dep
 from tracking.store import hash_file
@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 _MANIFEST_TTL = 30.0  # seconds; a frozen project need not hit Mongo on every checkpoint
 
+type Backend = Literal["file", "mongo_compact"]
+
 
 class FrozenProjectError(RuntimeError):
     """Raised when a run tries to write into a frozen project."""
@@ -34,6 +36,23 @@ class FrozenProjectError(RuntimeError):
 
 def default_db_name() -> str:
     return os.environ.get("TRACKING_MONGO_DB", "tracking")
+
+
+def default_file_root() -> Path:
+    """Root of the local run-document tree (``TRACKING_FILE_ROOT``).
+
+    Falls back to ``DATA_DIR/runs`` so ``backend="file"`` writes somewhere
+    predictable next to the historical ``experiments.jsonl`` location.
+    """
+    env = os.environ.get("TRACKING_FILE_ROOT")
+    if env:
+        return Path(env)
+    try:
+        from tracking.experiment import DATA_DIR
+
+        return Path(DATA_DIR) / "runs"
+    except Exception:
+        return Path(os.environ.get("DATA_DIR", ".")) / "runs"
 
 
 def default_store_root() -> str | Path:
@@ -77,12 +96,14 @@ def make_store(store_root: str | Path):
 
 @dataclass
 class Project:
-    """One paper / investigation, backed by one MongoDB database."""
+    """One paper / investigation, backed by MongoDB or local JSON files."""
 
     name: str
     db: str | None = None
     uri: str | None = None
     store_root: Path | str | None = None
+    backend: Backend = "mongo_compact"
+    file_root: Path | str | None = None
     writable: bool = False
     tree_excludes: tuple[str, ...] = ()
 
@@ -91,10 +112,16 @@ class Project:
     _manifest_at: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.backend not in ("file", "mongo_compact"):
+            raise ValueError(
+                f"unknown backend {self.backend!r}; expected 'mongo_compact' or 'file'"
+            )
         if self.db is None:
             self.db = self.name
         if self.store_root is None:
             self.store_root = default_store_root()
+        if self.file_root is None:
+            self.file_root = default_file_root()
 
     # -- connection ------------------------------------------------------
     @property
@@ -111,7 +138,14 @@ class Project:
 
         return get_mongo_client(self.uri)
 
+    def file_collection(self, name: str | None = None):
+        from tracking.file_backend import FileCollection
+
+        return FileCollection(self.file_root, name or "runs")
+
     def collection(self, name: str):
+        if self.backend == "file":
+            return self.file_collection(name)
         return self.client()[self.db][name or "runs"]
 
     # -- reads -----------------------------------------------------------
@@ -119,12 +153,25 @@ class Project:
         return list(self.collection(collection).find(query or {}))
 
     def load(self, collection: str, query: dict | None = None):
+        if self.backend == "file":
+            from tracking.load import load_file_data
+
+            return load_file_data(self.file_collection(collection), query=query)
         from tracking.load import load_mongo_data
 
         return load_mongo_data(self.collection(collection), query or {})
 
     def collection_names(self) -> list[str]:
-        """Non-internal collection names in this project's database."""
+        """Non-internal collection names in this project."""
+        if self.backend == "file":
+            root = Path(self.file_root)
+            if not root.is_dir():
+                return []
+            return sorted(
+                n
+                for n in (p.name for p in root.iterdir())
+                if p.is_dir() and not n.startswith(("_", "system."))
+            )
         names = self.client()[self.db].list_collection_names()
         return sorted(
             n for n in names if not n.startswith("_") and not n.startswith("system.")
@@ -143,6 +190,81 @@ class Project:
         if dest is None:
             return self.store.get_bytes(sha)
         return self.store.get_file(sha, dest)
+
+    def artifact_filename(self, descriptor: dict | str) -> str:
+        """Human-friendly filename (with extension) for an artifact."""
+        from tracking.artifact import artifact_filename
+
+        if isinstance(descriptor, str):
+            return f"{descriptor[:12]}.bin"
+        name = descriptor.get("filename") or descriptor.get("name") or ""
+        if not name:
+            name = f"{descriptor['sha256'][:12]}.bin"
+        return artifact_filename(
+            name,
+            format=descriptor.get("format"),
+            media_type=descriptor.get("media_type"),
+        )
+
+    def artifact_path(
+        self, descriptor: dict | str, dest: Path | str | None = None
+    ) -> Path:
+        """Path to a materialized artifact, with its proper filename ending.
+
+        With ``dest=None`` this returns the store's own local object/cache
+        path (no copy). ``dest`` may be a file path or an existing directory;
+        a directory receives ``artifact_filename(descriptor)``.
+        """
+        sha = descriptor["sha256"] if isinstance(descriptor, dict) else descriptor
+        filename = self.artifact_filename(descriptor)
+        if dest is not None:
+            target = Path(dest)
+            if target.is_dir() or target.suffix == "":
+                target = target / filename
+            return self.store.get_file(sha, target)
+        stored = self.store.get_file(sha)
+        # New objects carry the extension already; older hash-only objects
+        # still get a useful name when the caller supplies a destination.
+        return stored
+
+    def load_artifacts(
+        self,
+        collection: str | None = None,
+        query: dict | None = None,
+        dest: Path | str | None = None,
+    ):
+        """All artifacts as a DataFrame, with a ready-to-open local ``path``.
+
+        One row per artifact across matching runs, like :meth:`artifacts`,
+        plus ``filename`` and ``path``. Pass ``dest`` to materialize copies
+        under a directory (proper endings guaranteed); with ``dest=None`` the
+        path points at the content-addressed store/cache object, so no large
+        payload is duplicated.
+        """
+        df = self.artifacts(collection, query)
+        if df.empty:
+            return df
+        filenames: list[str] = []
+        paths: list[str] = []
+        used: set[str] = set()
+        for i, row in df.iterrows():
+            descriptor = row.to_dict()
+            filename = self.artifact_filename(descriptor)
+            if dest is not None:
+                target = Path(dest) / filename
+                if str(target) in used:
+                    prefix = str(descriptor.get("run_key") or descriptor["sha256"])[:8]
+                    target = Path(dest) / f"{prefix}_{filename}"
+                    filename = target.name
+                used.add(str(target))
+                path = self.artifact_path(descriptor, target)
+            else:
+                path = self.artifact_path(descriptor)
+            filenames.append(filename)
+            paths.append(str(path))
+        df["filename"] = filenames
+        df["path"] = paths
+        return df
 
     def artifacts(self, collection: str | None = None, query: dict | None = None):
         """One row per artifact across matching runs, newest fields flat.
@@ -265,9 +387,19 @@ class Project:
         if self._manifest is not None and now - self._manifest_at < _MANIFEST_TTL:
             return self._manifest
         try:
-            self._manifest = self.client()[self.db]["_manifest"].find_one(
-                {"_kind": "tracking.manifest"}
-            )
+            if self.backend == "file":
+                path = Path(self.file_root) / "_manifest.json"
+                import json
+
+                self._manifest = (
+                    json.loads(path.read_text(encoding="utf-8"))
+                    if path.is_file()
+                    else None
+                )
+            else:
+                self._manifest = self.client()[self.db]["_manifest"].find_one(
+                    {"_kind": "tracking.manifest"}
+                )
         except Exception:
             logger.debug("could not read project manifest", exc_info=True)
             return self._manifest

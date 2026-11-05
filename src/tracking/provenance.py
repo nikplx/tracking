@@ -304,11 +304,12 @@ def collect_inputs(
         path = Path(item)
         sha = hash_file(path)
         store.put_file(path)
+        stored = store.get_file(sha)
         record = {
             "name": path.name,
             "path": str(path),
             "sha256": sha,
-            "object": f"objects/{sha[:2]}/{sha}",
+            "object": f"objects/{sha[:2]}/{stored.name}",
         }
         records[(record["name"], record["path"])] = record
     return [records[key] for key in sorted(records)]

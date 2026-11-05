@@ -42,7 +42,7 @@ from tracking.system import system_fingerprint
 
 logger = logging.getLogger()
 
-type Backend = Literal["mongo_compact"]
+type Backend = Literal["file", "mongo_compact"]
 
 MONGO_DB = os.environ.get("TRACKING_MONGO_DB", "tracking")
 SCHEMA_VERSION = 2
@@ -106,9 +106,11 @@ def get_runs_collection(
 # ---------------------------------------------------------------------------
 
 class Experiment:
-    """One experiment calculation, tracked in the compact MongoDB backend.
+    """One experiment calculation, tracked in MongoDB or local JSON files.
 
-    Writes one self-contained MongoDB document per run::
+    Writes one self-contained document per run — to Mongo for
+    ``backend="mongo_compact"`` (the default) or to a local ``.json`` file for
+    ``backend="file"``::
 
         with Experiment(name, params, collection="sparsity_v1") as run:
             ...
@@ -129,8 +131,10 @@ class Experiment:
     ):
         self.name = name
         self.params = params
-        if backend != "mongo_compact":
-            raise ValueError(f"unknown backend {backend!r}; expected 'mongo_compact'")
+        if backend not in ("file", "mongo_compact"):
+            raise ValueError(
+                f"unknown backend {backend!r}; expected 'mongo_compact' or 'file'"
+            )
         self.backend = backend
         self.checkpoint_enabled = checkpoints
         self.collection = collection or "runs"
@@ -163,10 +167,13 @@ class Experiment:
     def _collection(self):
         """Resolve the target collection.
 
-        The no-project path calls the module-level helper with the same
+        The no-project Mongo path calls the module-level helper with the same
         single argument it always took, so monkeypatching
-        ``tracking.experiment.get_runs_collection`` keeps working.
+        ``tracking.experiment.get_runs_collection`` keeps working. The file
+        backend is project-aware but does not require Mongo.
         """
+        if self.backend == "file":
+            return self.project.file_collection(self.collection)
         if self._project is None:
             return get_runs_collection(self.collection)
         return get_runs_collection(self.collection, project=self._project)
@@ -389,15 +396,20 @@ class Experiment:
             return False
         if rerun not in ("missing", "stale"):
             raise ValueError(f"unknown rerun policy: {rerun!r}")
-        if backend != "mongo_compact":
+        if backend not in ("file", "mongo_compact"):
             raise ValueError(f"unknown backend: {backend!r}")
 
         h = spec_hash(params)
-        coll = (
-            get_runs_collection(collection or "runs")
-            if project is None
-            else get_runs_collection(collection or "runs", project=project)
-        )
+        if backend == "file":
+            from tracking.project import default_project
+
+            coll = (project or default_project()).file_collection(
+                collection or "runs"
+            )
+        elif project is None:
+            coll = get_runs_collection(collection or "runs")
+        else:
+            coll = get_runs_collection(collection or "runs", project=project)
         try:
             coll.create_index([("spec_hash", 1), ("run_key", 1), ("status", 1)])
         except Exception:
